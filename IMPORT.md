@@ -13,6 +13,11 @@ doesn't already emit x64-style import thunks (see "Wine patch" below).
 
 ## DroidDeck
 
+> **Automate it:** `./install.sh` pushes `bin/libarm64ecfex.dll` to the connected device
+> and does steps 1–2 below for you (backs up the original, updates the tool and the prefix,
+> prints the sha256). Run `./install.sh --help` for options. It needs `adb` plus either
+> DroidDeck's `droiddeckctl` on PATH, `--ctl PATH`, or a custom `--guest-command`.
+
 ### 1. Replace the FEX DLL
 
 The FEX binary lives inside your Proton tool's Wine libraries. For the standard
