@@ -1,52 +1,111 @@
-# Forza Horizon 6 on ARM64 — Wine + FEX patches
+# Forza Horizon 6 on ARM64 Android (DroidDeck)
 
-Run Forza Horizon 6 on ARM64 (Snapdragon 8 Elite / DroidDeck-class devices) through
-Wine + FEX, pass its anti-tamper checks, and hold a playable in-world frame rate.
+A patched FEX that lets Forza Horizon 6 boot past its anti-tamper checks and play on
+Snapdragon 8 Elite phones and handhelds running [DroidDeck](https://github.com/Droid-Deck).
 
-These are **compatibility/correctness patches, not anti-cheat bypasses**. They make the
-ARM64EC runtime behave the way native Windows x64 does, so the game's own integrity
-checks pass honestly.
+Everything installs on the phone itself. You don't need a PC, adb or any scripts.
 
-## Result
+## What you need
 
-- Boots through the anti-tamper checks with no workarounds or disabled checks.
-- **~38.9 FPS in-world** on a DroidDeck (Snapdragon 8 Elite), 120 Hz panel.
-- Built and tested on top of upstream FEX `main` and Proton 11.0.
+- DroidDeck, with Steam set up and Forza Horizon 6 installed (Steam AppID 2483190).
+- A Snapdragon 8 Elite class device. That's what this was tested on (Adreno 830, 120 Hz panel).
+- About 12 GB of free RAM plus swap. The game uses 9–11 GB in the world.
 
-## What's inside
+## Install (DroidDeck, 5 steps)
 
-| Path | What it is | Drop-in? |
-|------|------------|----------|
-| `bin/libarm64ecfex.dll` | Prebuilt FEX (ARM64EC) with both FEX patches applied | Yes |
-| `fex/0001-per-block-invalidation.patch` | FEX: invalidate only the block that changed instead of its whole page | Source |
-| `fex/0002-block-level-smc-validation.patch` | FEX: self-modifying-code checks in 255-byte chunks instead of per-instruction | Source |
-| `wine/spec32-arm64x-import-thunk.patch` | Wine: ARM64EC import thunks get the same hotpatch prologue as native x64 | Source |
+1. **Download the FEX package on your phone.**
+   Open the [latest release](https://github.com/TimmyTurner51/fh6-wine-fex/releases/latest)
+   and download **`fh6-fex-droiddeck.wcp`**.
 
-## How it works (short version)
+2. **Install DroidDeck-Proton.**
+   In DroidDeck, open **Setup**, add **DroidDeck-Proton**, and install version **11-12.3 or newer**.
+   Valve's *Proton Experimental (ARM64)* will **not** work. It is missing a Wine fix the
+   anti-tamper needs (see [Why DroidDeck-Proton](#why-droiddeck-proton)).
 
-**Wine** — Forza's anti-tamper inspects the prologue of every exported function. On
-ARM64EC, Wine emitted a bare `jmp [import]` thunk where native Windows emits the standard
-8-byte hotpatch prologue, so the game classified each import as "hooked". The patch makes
-the ARM64EC thunks byte-identical to native x64 (`48 8d a4 24 00 00 00 00 ff 25`).
+3. **Import the package.**
+   Open **Components**, tap **Import .wcp**, and pick `fh6-fex-droiddeck.wcp` from your
+   Downloads. It shows up as FEX **FH6-1.0**.
 
-**FEX** — with `FEX_SMCCHECKS=full`, FEX validates the bytes of every instruction before
-it runs. The two patches make that check cheap enough for real gameplay: a changed block
-invalidates *only that block* (not the page), and validation runs once per 255-byte chunk
-(not once per instruction).
+4. **Set up Forza Horizon 6's profile.**
+   On the Components page, open the profile for **Forza Horizon 6** and set:
 
-## Import
+   | Setting | Value |
+   |---|---|
+   | Proton | **DroidDeck-Proton 11-12.3** (or newer) |
+   | FEX | **FH6-1.0** |
+   | FEX preset | **Denuvo** |
+   | Custom FEX variables | `FEX_TSOENABLED=1` and `FEX_HALFBARRIERTSOENABLED=1` |
 
-Step-by-step instructions for **DroidDeck** and **GameNative** (and any other app that
-accepts custom Wine + FEX packages) are in [IMPORT.md](IMPORT.md).
+   Don't skip the two custom variables. The Denuvo preset turns x86 memory ordering (TSO)
+   off, and without it the game stalls on the splash or loading screen.
+
+5. **Launch the game** from Steam.
+   The first launch takes several minutes, because FEX translates the game and fills its
+   cache. Later launches are faster.
+
+If the overlay shows `DroidDeck-Proton 11-12.3` and the game reaches the main menu, it
+worked.
+
+## What to expect
+
+- It boots and passes the anti-tamper checks, with no checks disabled.
+- About **30–40 FPS** in the world at 1590×720, with drops in dense areas such as the city.
+- There's a small, regular frame-time spike (visible in the overlay graph) that is still
+  being investigated.
+- The phone gets hot. Expect throttling after about 6–8 minutes without a cooler.
+
+## Troubleshooting
+
+| Problem | Fix |
+|---|---|
+| Game closes about a second after launch | Proton is wrong. Select DroidDeck-Proton for the game, not Proton Experimental. |
+| Stuck on splash or loading screen, CPU busy, nothing progresses | `FEX_TSOENABLED=1` and `FEX_HALFBARRIERTSOENABLED=1` are missing from the game's custom FEX variables. |
+| Anti-tamper or "integrity" error | The FEX package isn't active. Check that the game's FEX shows **FH6-1.0**, and the preset is **Denuvo** (it turns on full code checks). |
+| Very slow, single-digit FPS | Check that the preset is **Denuvo**. Other presets turn the code checks off or use a slower mode. Let the phone cool down too, because a throttled CPU halves the frame rate. |
+| Steam updated Proton and things broke | Your DroidDeck-Proton choice is per game and isn't touched by Steam updates. Re-check step 4. |
+
+## GameNative and other Winlator-style apps (untested)
+
+`fh6-fex-gamenative.wcp` in the same release is the same FEX in the `FEXCore` package
+format these apps import. It won't be enough on its own. The app's Wine must also include
+the import-thunk fix in [`wine/spec32-arm64x-import-thunk.patch`](wine/spec32-arm64x-import-thunk.patch),
+and you need the same FEX variables as above (`FEX_SMCCHECKS=full`, `FEX_HIDEHYPERVISORBIT=1`,
+`FEX_TSOENABLED=1`, `FEX_HALFBARRIERTSOENABLED=1`). This path hasn't been tested.
+
+## Why DroidDeck-Proton
+
+Forza's anti-tamper checks the first bytes of exported Windows functions. Native Windows,
+and Wine on x86_64, start those import thunks with a standard 8-byte "hotpatch" prologue.
+Wine on ARM64EC used to emit a bare `jmp` instead, so the game decided its imports were
+hooked. The Wine patch in this repo fixes that. DroidDeck-Proton 11-12.3 already ships
+`kernel32` with the fixed thunks (797 of them). Valve's current Proton Experimental (ARM64)
+has none.
+
+## What's in this repo
+
+| Path | What it is |
+|---|---|
+| Releases → `fh6-fex-droiddeck.wcp` | The FEX package for DroidDeck (use this) |
+| Releases → `fh6-fex-gamenative.wcp` | Same FEX, packaged for GameNative/Winlator-style apps |
+| `bin/libarm64ecfex.dll` | The bare FEX DLL inside both packages (sha256 `67dc9fda…`) |
+| `fex/*.patch` | The two FEX source patches |
+| `wine/*.patch` | The Wine import-thunk patch |
+| `tools/make-wcp.sh` | Rebuilds both `.wcp` packages from `bin/libarm64ecfex.dll` |
+| [`BUILDING.md`](BUILDING.md) | How to build FEX and Wine from source |
+
+The FEX patches make `FEX_SMCCHECKS=full` cheap enough to play with. A changed block
+invalidates only that block instead of its whole page, and code is validated once per
+255-byte chunk instead of once per instruction.
+
+These are compatibility fixes, not anti-cheat bypasses. They make the ARM64EC runtime
+behave the way native x64 Windows does, so the game's own checks pass honestly.
 
 ## Source
 
-The patches are tracked as clean branches against upstream:
-
-- Wine — `TimmyTurner51/proton-wine`, branch `fh6`
-- FEX — `TimmyTurner51/FEX`, branch `fh6`
+- FEX: [`TimmyTurner51/FEX`](https://github.com/TimmyTurner51/FEX), branch `fh6`
+- Wine: [`TimmyTurner51/proton-wine`](https://github.com/TimmyTurner51/proton-wine), branch `fh6`
 
 ## License
 
 Each patch is a modification of its parent project and carries that project's license:
-Wine is LGPL-2.1-or-later, FEX is MIT. See the upstream repositories for the full text.
+Wine is LGPL-2.1-or-later, FEX is MIT.
