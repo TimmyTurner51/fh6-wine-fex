@@ -5,8 +5,10 @@ You only need this if you want to build the FEX DLL or Wine yourself. To play, f
 
 ## FEX (`libarm64ecfex.dll`)
 
-Apply both patches to upstream FEX `main`, or check out the `fh6` branch of
-[`TimmyTurner51/FEX`](https://github.com/TimmyTurner51/FEX), which already has them.
+The release DLL matches [`TimmyTurner51/FEX`](https://github.com/TimmyTurner51/FEX)
+branch `fh6-dev` at `7e11bf935`. To rebuild that binary, check out that commit.
+
+To apply only the compatibility fixes on upstream FEX `main` or on `fh6`:
 
 ```sh
 git clone https://github.com/FEX-Emu/FEX.git
@@ -14,6 +16,7 @@ cd FEX
 git submodule update --init --depth 1
 git apply /path/to/fh6-wine-fex/fex/0001-per-block-invalidation.patch
 git apply /path/to/fh6-wine-fex/fex/0002-block-level-smc-validation.patch
+git apply /path/to/fh6-wine-fex/fex/0003-l1-recommit-on-grow.patch
 ```
 
 Cross-compile the ARM64EC target with [llvm-mingw](https://github.com/mstorsjo/llvm-mingw).

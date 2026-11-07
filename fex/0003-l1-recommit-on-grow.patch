@@ -1,0 +1,34 @@
+From 7e11bf9356957c64019408c7a83226c95ed7750d Mon Sep 17 00:00:00 2001
+From: TimmyTurner51 <TimmyTurner51@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 10:52:10 -0600
+Subject: [PATCH] LookupCache: recommit the full L1 range when growing the
+ dynamic L1 cache
+
+On Windows, VirtualDontNeed(..., Recommit=false) is VirtualFree(MEM_DECOMMIT)
+without a matching commit. The grow path then writes the new upper half from
+host C++ (AddL1Entry) and faults. Recommit the whole grown range so that
+write is valid. This stops a hard hang when Forza Horizon 6 enters the world.
+
+---
+ FEXCore/Source/Interface/Core/LookupCache.h | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/FEXCore/Source/Interface/Core/LookupCache.h b/FEXCore/Source/Interface/Core/LookupCache.h
+index d46339bb9..1270da99d 100644
+--- a/FEXCore/Source/Interface/Core/LookupCache.h
++++ b/FEXCore/Source/Interface/Core/LookupCache.h
+@@ -272,8 +272,10 @@ public:
+ 
+       if (AveragePerSecond >= DynamicL1CacheIncreaseCountHeuristic()) {
+         if (CurrentL1Entries < MAX_L1_ENTRIES) {
+-          // Entries whose address has the new mask bit set would be unreachable by InvalidateCache
+-          FEXCore::Allocator::VirtualDontNeed(reinterpret_cast<void*>(L1Pointer), CurrentL1Entries * sizeof(LookupCacheEntry), false);
++          // Entries whose address has the new mask bit set would be unreachable by InvalidateCache.
++          // The upper half may have been decommitted by an earlier shrink and is written below from
++          // host code, so zero and recommit the whole grown range.
++          FEXCore::Allocator::VirtualDontNeed(reinterpret_cast<void*>(L1Pointer), (CurrentL1Entries << 1) * sizeof(LookupCacheEntry), true);
+ 
+           CurrentL1Entries <<= 1;
+           L1PointerMask = CurrentL1Entries - 1;
+-- 
+2.53.0
