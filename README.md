@@ -24,7 +24,7 @@ Everything installs on the phone itself. You don't need a PC, adb or any scripts
 
 3. **Import the package.**
    Open **Components**, tap **Import .wcp**, and pick `fh6-fex-droiddeck.wcp` from your
-   Downloads. It shows up as FEX **FH6-1.1**.
+   Downloads. It shows up as FEX **FH6-1.2**.
 
 4. **Set up Forza Horizon 6's profile.**
    On the Components page, open the profile for **Forza Horizon 6** and set:
@@ -32,7 +32,7 @@ Everything installs on the phone itself. You don't need a PC, adb or any scripts
    | Setting | Value |
    |---|---|
    | Proton | **DroidDeck-Proton 11-12.3** (or newer) |
-   | FEX | **FH6-1.1** |
+   | FEX | **FH6-1.2** |
    | FEX preset | **Denuvo** |
    | Custom FEX variables | `FEX_TSOENABLED=1`, `FEX_HALFBARRIERTSOENABLED=1`, and `FEX_POOL_CLONE=1` |
 
@@ -51,11 +51,32 @@ worked.
 ## What to expect
 
 - It boots and passes the anti-tamper checks, with no checks disabled.
-- About **30 FPS** in the world at 1590×720 (highway overlay ~31 AVG, 1% low ~12).
-  Dense city streaming can hitch while buildings page in.
-- 1.0 could hard-halt on garage / world entry. 1.1 recommits FEX's L1 lookup table
-  when it grows, so that load completes.
+- About **44–49 FPS** in the world at 1590×720, mean over a 180-second hold, with the
+  slowest second at 39–41 and the fastest at 50–56. That is roughly 15 FPS above 1.1 on
+  the same road.
+- The regular frame-time beat that 1.1 showed once a second is gone.
+- No crash and no core across two full holds back to back. That run used the FEX in this
+  repo together with the ntdll change in
+  [`wine/arm64ec-frame-regs.patch`](wine/arm64ec-frame-regs.patch), which keeps the
+  registers an x64 context cannot carry. DroidDeck-Proton 11-12.3 does not ship that
+  change yet, so if a session still ends with the game vanishing at a suspend, that is
+  the piece that is missing.
 - The phone gets hot. Expect throttling after about 6–8 minutes without a cooler.
+
+## What changed in 1.2
+
+The frame graph rather than the crash was the thing left to fix. 1.1 spent a large share
+of each second in FEX's lookup-table lock and in single-entry SMC invalidations, and it
+threw away a code buffer as soon as it grew. 1.2 changes the runtime instead of the game:
+
+- A code buffer that grows now continues its chain. It used to be freed while exit links
+  and lookup entries still pointed into its code.
+- Any live code buffer counts as JIT, so a thread that moved to a newer chain is still
+  recognised when a signal lands in an older one.
+- SMC invalidations are batched, with a gap between batches so readers get the lock.
+
+Result on the test device: 30.3 FPS mean before, 48.5 and 44.5 on two consecutive holds,
+with no 550 ms frame beats and no frames slower than 80 ms.
 
 ## Troubleshooting
 
@@ -63,8 +84,10 @@ worked.
 |---|---|
 | Game closes about a second after launch | Proton is wrong. Select DroidDeck-Proton for the game, not Proton Experimental. |
 | Stuck on splash or loading screen, CPU busy, nothing progresses | `FEX_TSOENABLED=1` and `FEX_HALFBARRIERTSOENABLED=1` are missing from the game's custom FEX variables. |
-| Anti-tamper or "integrity" error | The FEX package isn't active. Check that the game's FEX shows **FH6-1.1**, and the preset is **Denuvo** (it turns on full code checks). |
-| Hard halt on garage / world loading | You are still on FH6-1.0. Import **FH6-1.1**. |
+| Anti-tamper or "integrity" error | The FEX package isn't active. Check that the game's FEX shows **FH6-1.2**, and the preset is **Denuvo** (it turns on full code checks). |
+| Hard halt on garage / world loading | You are on FH6-1.0. Import **FH6-1.2**, which keeps the L1 lookup table committed when it grows. |
+| FPS stuck around 30 like 1.1 | The game is still on the old package. Re-import `fh6-fex-droiddeck.wcp` and check the FEX shows **FH6-1.2**. |
+| Game disappears mid-session at a suspend | The Wine side is missing `wine/arm64ec-frame-regs.patch`. See [What to expect](#what-to-expect). |
 | Very slow, single-digit FPS | Check that the preset is **Denuvo**. Other presets turn the code checks off or use a slower mode. Let the phone cool down too, because a throttled CPU halves the frame rate. |
 | Steam updated Proton and things broke | Your DroidDeck-Proton choice is per game and isn't touched by Steam updates. Re-check step 4. |
 
@@ -91,15 +114,19 @@ has none.
 |---|---|
 | Releases → `fh6-fex-droiddeck.wcp` | The FEX package for DroidDeck (use this) |
 | Releases → `fh6-fex-gamenative.wcp` | Same FEX, packaged for GameNative/Winlator-style apps |
-| `bin/libarm64ecfex.dll` | The bare FEX DLL inside both packages (sha256 `fabe72dd…`) |
-| `fex/*.patch` | FEX source patches (SMC checks + L1 grow recommit) |
-| `wine/*.patch` | The Wine import-thunk patch |
+| `bin/libarm64ecfex.dll` | The bare FEX DLL inside both packages (sha256 `694c52e7…`) |
+| `fex/*.patch` | FEX source patches: SMC checks, L1 grow recommit, and the 1.2 runtime work |
+| `wine/*.patch` | The Wine import-thunk patch and the ARM64EC frame-register patch |
 | `tools/make-wcp.sh` | Rebuilds both `.wcp` packages from `bin/libarm64ecfex.dll` |
 | [`BUILDING.md`](BUILDING.md) | How to build FEX and Wine from source |
 
 The FEX patches make `FEX_SMCCHECKS=full` cheap enough to play with (block-level
-invalidation and 255-byte chunk validation), and they recommit the dynamic L1
-lookup table on grow so Windows does not leave that table decommitted.
+invalidation and 255-byte chunk validation), recommit the dynamic L1 lookup table on
+grow so Windows does not leave that table decommitted, and in 1.2 keep a growing code
+buffer chain alive, treat every live buffer as JIT when a signal arrives, and erase SMC
+entries in batches so a writer cannot park every reader. Twelve patch files would be
+noise, so the 1.2 runtime work is one patch: `0004-jit-stability-and-smc-batching.patch`.
+The four FEX patches together reproduce `bin/libarm64ecfex.dll` exactly.
 
 These are compatibility fixes, not anti-cheat bypasses. They make the ARM64EC runtime
 behave the way native x64 Windows does, so the game's own checks pass honestly.
@@ -107,7 +134,8 @@ behave the way native x64 Windows does, so the game's own checks pass honestly.
 ## Source
 
 - FEX: [`TimmyTurner51/FEX`](https://github.com/TimmyTurner51/FEX), branch `fh6-dev` (prebuilt); `fh6` plus `fex/*.patch` for the compatibility fixes alone
-- Wine: [`TimmyTurner51/proton-wine`](https://github.com/TimmyTurner51/proton-wine), branch `fh6`
+- Wine: [`TimmyTurner51/proton-wine`](https://github.com/TimmyTurner51/proton-wine), branch `fh6`; `wine/arm64ec-frame-regs.patch` applies at `462e0d2f`
+- Every FEX patch in `fex/` applies in order to FEX `main` at `14c92681`
 
 ## License
 

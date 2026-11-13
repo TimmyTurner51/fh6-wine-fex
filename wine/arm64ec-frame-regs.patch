@@ -1,0 +1,109 @@
+ARM64EC: keep the registers an x64 context cannot carry
+
+Applies to TimmyTurner51/proton-wine at 462e0d2f (branch fh6), dlls/ntdll/unix.
+
+Converting a CONTEXT to and from its ARM64EC form leaves x13, x14, x23, x24
+and x28 zeroed, because x64 has no register in those slots. FEX's JIT keeps
+live values in them. When a syscall or a suspend crosses that boundary, the
+JIT returns to a context with no state pointer in x28 and RSP 0, and dies.
+
+fh6_keep_frame_regs() puts the three the JIT relies on back from the syscall
+frame; fh6_save_jit_regs()/fh6_keep_jit_regs() carry all five across
+wait_suspend(). In both cases the context must still describe the same
+instruction, which is the pc check.
+
+diff --git a/dlls/ntdll/unix/signal_arm64.c b/dlls/ntdll/unix/signal_arm64.c
+index c18e650..8339033 100644
+--- a/dlls/ntdll/unix/signal_arm64.c
++++ b/dlls/ntdll/unix/signal_arm64.c
+@@ -338,6 +338,45 @@ static void restore_context( const CONTEXT *context, ucontext_t *sigcontext )
+ }
+ 
+ 
++struct fh6_jit_regs
++{
++    ULONG64 pc, x13, x14, x23, x24, x28;
++};
++
++static void fh6_save_jit_regs( struct fh6_jit_regs *r, ULONG64 pc, const ULONG64 *x )
++{
++    r->pc = pc;
++    r->x13 = x[13];
++    r->x14 = x[14];
++    r->x23 = x[23];
++    r->x24 = x[24];
++    r->x28 = x[28];
++}
++
++/* An ARM64EC context has no room for the registers that x64 does not use, so a translation to and
++ * from one zeroes x13, x14, x23, x24 and x28. JIT code keeps live values there. Put them back when
++ * the context still describes the same instruction. */
++static void fh6_keep_jit_regs( const struct fh6_jit_regs *r, CONTEXT *ctx )
++{
++    if (!is_arm64ec() || ctx->Pc != r->pc || !r->x28 || ctx->X[28]) return;
++    ctx->X[13] = r->x13;
++    ctx->X[14] = r->x14;
++    ctx->X[23] = r->x23;
++    ctx->X[24] = r->x24;
++    ctx->X[28] = r->x28;
++}
++
++/* Same idea for the syscall frame: a JIT helper that called into ntdll returns to code that expects
++ * its caller-saved state. The frame still has it. */
++static void fh6_keep_frame_regs( CONTEXT *ctx, const struct syscall_frame *frame )
++{
++    if (!is_arm64ec() || (ctx->ContextFlags & CONTEXT_INTEGER) != CONTEXT_INTEGER) return;
++    if (ctx->X[28] || !frame->x[28] || !is_ec_code( ctx->Pc )) return;
++    ctx->X[23] = frame->x[23];
++    ctx->X[24] = frame->x[24];
++    ctx->X[28] = frame->x[28];
++}
++
+ /***********************************************************************
+  *           signal_set_full_context
+  */
+@@ -348,13 +387,19 @@ NTSTATUS signal_set_full_context( CONTEXT *context )
+     CHPE_V2_CPU_AREA_INFO *cpu_area = NtCurrentTeb()->ChpeV2CpuAreaInfo;
+     NTSTATUS status;
+ 
++    fh6_keep_frame_regs( context, frame );
++
+     if (arm64_data->suspend_pending && !cpu_area->InSyscallCallback && !cpu_area->InSimulation)
+     {
+         sigset_t old_set;
++        struct fh6_jit_regs jit;
++
+         pthread_sigmask( SIG_BLOCK, &server_block_set, &old_set );
+         *cpu_area->SuspendDoorbell = 0;
+         arm64_data->suspend_pending = FALSE;
++        fh6_save_jit_regs( &jit, context->Pc, context->X );
+         wait_suspend( context );
++        fh6_keep_jit_regs( &jit, context );
+         status = NtSetContextThread( GetCurrentThread(), context );
+         pthread_sigmask( SIG_SETMASK, &old_set, NULL );
+     }
+@@ -1353,16 +1398,24 @@ static void usr1_handler( int signal, siginfo_t *siginfo, void *sigcontext )
+     }
+     else if (is_inside_syscall( SP_sig(ucontext) ))
+     {
++        struct fh6_jit_regs jit;
++
+         context.ContextFlags = CONTEXT_FULL | CONTEXT_EXCEPTION_REQUEST;
+         NtGetContextThread( GetCurrentThread(), &context );
++        fh6_save_jit_regs( &jit, context.Pc, context.X );
+         wait_suspend( &context );
++        fh6_keep_jit_regs( &jit, &context );
+         NtSetContextThread( GetCurrentThread(), &context );
+     }
+     else
+     {
++        struct fh6_jit_regs jit;
++
+         save_context( &context, ucontext );
+         context.ContextFlags |= CONTEXT_EXCEPTION_REPORTING;
++        fh6_save_jit_regs( &jit, context.Pc, context.X );
+         wait_suspend( &context );
++        fh6_keep_jit_regs( &jit, &context );
+         restore_context( &context, ucontext );
+     }
+ }

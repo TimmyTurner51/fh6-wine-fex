@@ -1,0 +1,2395 @@
+FH6 runtime: live code buffers, chained growth, batched SMC erases
+
+Applies on top of 0001-0003 and completes the series; the four patches
+together reproduce bin/libarm64ecfex.dll in this repo.
+
+- Count any live code buffer as JIT, not only the current chain, so a
+  thread that migrated to a newer chain keeps working in an older one.
+- Track live buffer ranges in a lockless registry that signal context can
+  query.
+- Continue the code buffer chain when growing instead of starting a new
+  one; the replaced buffer used to be freed while exit links still
+  pointed into its code.
+- Queue SMC erases and erase runs of them under one write lock, with a
+  reader gap between batches. The map lock favours writers, so one
+  acquisition per event parked every reader.
+- Carries the optional experiment flags documented in README:
+  FEX_FH6_FASTUD, FEX_FH6_SPINSAMPLE, FEX_POOL_CLONE, FH6Stats counters.
+
+diff --git a/CodeEmitter/CodeEmitter/Buffer.h b/CodeEmitter/CodeEmitter/Buffer.h
+index 602eeb674..407eb2374 100644
+--- a/CodeEmitter/CodeEmitter/Buffer.h
++++ b/CodeEmitter/CodeEmitter/Buffer.h
+@@ -66,6 +66,23 @@ public:
+     __builtin___clear_cache(static_cast<char*>(Begin), static_cast<char*>(Begin) + Length);
+   }
+ 
++  // Publish one patched instruction without a barrier. Pair with FinishICacheInvalidate.
++  static void InvalidateICacheLine(void* Begin) {
++#if defined(ARCHITECTURE_arm64)
++    auto Addr = reinterpret_cast<uintptr_t>(Begin);
++    __asm__ volatile("dc cvau, %0" : : "r"(Addr) : "memory");
++    __asm__ volatile("ic ivau, %0" : : "r"(Addr) : "memory");
++#else
++    ClearICache(Begin, 4);
++#endif
++  }
++
++  static void FinishICacheInvalidate() {
++#if defined(ARCHITECTURE_arm64)
++    __asm__ volatile("dsb ish\n\tisb" : : : "memory");
++#endif
++  }
++
+   size_t GetCursorOffset() const {
+     return static_cast<size_t>(CurrentOffset - BufferBase);
+   }
+diff --git a/FEXCore/Source/Interface/Core/CPUBackend.cpp b/FEXCore/Source/Interface/Core/CPUBackend.cpp
+index ac39051ed..57e8f60a2 100644
+--- a/FEXCore/Source/Interface/Core/CPUBackend.cpp
++++ b/FEXCore/Source/Interface/Core/CPUBackend.cpp
+@@ -7,6 +7,7 @@
+ 
+ #include <FEXCore/IR/IR.h>
+ #include <FEXCore/Utils/AllocatorHooks.h>
++#include <FEXCore/Utils/FH6Stats.h>
+ #include <FEXCore/Utils/PrctlUtils.h>
+ 
+ #include <cstdint>
+@@ -332,6 +333,7 @@ namespace CPU {
+   fextl::shared_ptr<CodeBuffer> CPUBackend::CheckCodeBufferUpdate() {
+     auto NewCodeBuffer = SharedCodeBuffers.GetLatest();
+     if (CurrentCodeBuffer != NewCodeBuffer) {
++      FEXCore::FH6Stats::Add(FEXCore::FH6Stats::CodeBufferUpdates);
+       RegisterForSignalHandler(CurrentCodeBuffer);
+       return std::exchange(CurrentCodeBuffer, NewCodeBuffer);
+     }
+@@ -340,9 +342,7 @@ namespace CPU {
+ 
+   bool CPUBackend::IsAddressInCodeBuffer(uintptr_t Address) const {
+     const auto CheckCodeBuffer = [](const CodeBuffer& Buffer, uintptr_t Address) {
+-      const auto BufferPtr = reinterpret_cast<uintptr_t>(Buffer.GetBufferBase());
+-      const uintptr_t LastPageAddr = BufferPtr + Buffer.UsableSize();
+-      return (Address >= BufferPtr && Address < LastPageAddr);
++      return Buffer.ChainContains(Address);
+     };
+ 
+     if (CheckCodeBuffer(*CurrentCodeBuffer, Address)) {
+@@ -353,7 +353,7 @@ namespace CPU {
+         return true;
+       }
+     }
+-    return false;
++    return CodeBuffer::AnyLiveContains(Address);
+   }
+ 
+ } // namespace CPU
+diff --git a/FEXCore/Source/Interface/Core/CPUBackend.h b/FEXCore/Source/Interface/Core/CPUBackend.h
+index 0183694cd..fbee6819b 100644
+--- a/FEXCore/Source/Interface/Core/CPUBackend.h
++++ b/FEXCore/Source/Interface/Core/CPUBackend.h
+@@ -131,6 +131,9 @@ namespace CPU {
+      */
+     virtual void ClearRelocations() {}
+ 
++    // Pad relocatable constants to a fixed length for the next compiles, even without a code cache.
++    virtual void SetRelocatablePadding(bool Enable) {}
++
+     bool IsAddressInCodeBuffer(uintptr_t Address) const;
+ 
+     // Updates the CodeBuffer if needed and returns a reference to the old one.
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+index cb0bf5005..da189440b 100644
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -9,6 +9,11 @@ $end_info$
+ */
+ 
+ #include <cstdint>
++#include <atomic>
++#include <chrono>
++#include <cstring>
++#include <mutex>
++#include <thread>
+ #ifdef ZYDIS_DISASSEMBLER
+ #include <Zydis/Zydis.h>
+ #endif
+@@ -51,10 +56,12 @@ $end_info$
+ #include <FEXCore/Utils/Threads.h>
+ #include <FEXCore/Utils/Profiler.h>
+ #include <FEXCore/Utils/SHMStats.h>
++#include <FEXCore/Utils/FH6Stats.h>
+ #include <FEXCore/fextl/fmt.h>
+ #include <FEXCore/fextl/memory.h>
+ #include <FEXCore/fextl/set.h>
+ #include <FEXCore/fextl/sstream.h>
++#include <FEXCore/fextl/unordered_map.h>
+ #include <FEXCore/fextl/vector.h>
+ #include <FEXHeaderUtils/Syscalls.h>
+ 
+@@ -79,10 +86,112 @@ $end_info$
+ #include <xxhash.h>
+ 
+ namespace FEXCore::Context {
++namespace {
++// Read once here: getenv takes the CRT environment lock, which must not be taken while compiling.
++int PoolCloneModeValue = 1;
++
++// GitHub InvalidateBlock on the presenting thread is the 1 Hz hitch (write lock).
++// Delink died on drive (hbasync2/hbmtx). LoopTop-on-mismatch stalled title
++// (hbreuse). hbmap mapping-only held. Reuse the stashed original host when
++// guest CRC matches; otherwise compile (title occupancy).
++Event SMCInvalidateEvent;
++std::once_flag SMCInvalidateOnce;
++fextl::unique_ptr<FEXCore::Threads::Thread> SMCInvalidateWorkerThread;
++
++// Queued SMC erases. The worker used to take the map's write lock once per event, and every one of
++// those parks the WritePriorityMutex readers, which is the bulk of the time spent in lock_shared.
++// Entries are drained in runs and erased under a single lock acquisition; the order of the erases is
++// the order they were queued, as before. A full ring falls back to erasing at the producer.
++struct SMCPendingEntry {
++  FEXCore::GuestToHostMap* Map;
++  uint64_t RIP;
++};
++constexpr size_t SMCPendingCap = 4096;
++SMCPendingEntry SMCPendingEntries[SMCPendingCap];
++std::atomic<size_t> SMCPendingCount {0};
++std::mutex SMCPendingMutex;
++
++void* SMCInvalidateWorker(void*) {
++  constexpr size_t BatchMax = 64;
++  SMCPendingEntry Batch[BatchMax];
++  uint64_t RIPs[BatchMax];
++
++  for (;;) {
++    SMCInvalidateEvent.Wait();
++
++    size_t Count;
++    size_t N;
++    {
++      std::lock_guard<std::mutex> lk(SMCPendingMutex);
++      Count = SMCPendingCount.load(std::memory_order_relaxed);
++      N = Count < BatchMax ? Count : BatchMax;
++      if (N) {
++        memcpy(Batch, SMCPendingEntries, N * sizeof(SMCPendingEntry));
++        memmove(SMCPendingEntries, SMCPendingEntries + N, (Count - N) * sizeof(SMCPendingEntry));
++        SMCPendingCount.store(Count - N, std::memory_order_release);
++      }
++    }
++    if (!N) {
++      continue;
++    }
++
++    for (size_t i = 0; i < N;) {
++      size_t j = i;
++      while (j < N && Batch[j].Map == Batch[i].Map) {
++        RIPs[j - i] = Batch[j].RIP;
++        ++j;
++      }
++      Batch[i].Map->EraseMappingsOnly(RIPs, j - i);
++      i = j;
++    }
++
++    if (SMCPendingCount.load(std::memory_order_acquire) != 0) {
++      // More is queued. The map lock favours writers, so taking it again right away would starve every
++      // reader of it (that is the 1 FPS start-up stall). Leave the readers a window first.
++      std::this_thread::sleep_for(std::chrono::microseconds(500));
++    }
++  }
++}
++
++void QueueSMCInvalidate(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestRIP) {
++  Thread->CurrentFrame->LastSMCInvalidateRIP = GuestRIP;
++  Thread->LookupCache->InvalidateLocalCache(GuestRIP);
++  auto* Map = Thread->LookupCache->GetSharedMap();
++  std::call_once(SMCInvalidateOnce, [] {
++    SMCInvalidateWorkerThread = FEXCore::Threads::Thread::Create(SMCInvalidateWorker, nullptr, {}, "FEX_SMCInv");
++  });
++  if (!SMCInvalidateWorkerThread || !Map) {
++    if (Map) {
++      Map->EraseMappingOnly(GuestRIP);
++    }
++    return;
++  }
++
++  bool Queued = false;
++  {
++    std::lock_guard<std::mutex> lk(SMCPendingMutex);
++    const size_t Count = SMCPendingCount.load(std::memory_order_relaxed);
++    if (Count < SMCPendingCap) {
++      SMCPendingEntries[Count] = {Map, GuestRIP};
++      SMCPendingCount.store(Count + 1, std::memory_order_release);
++      Queued = true;
++    }
++  }
++  if (!Queued) {
++    Map->EraseMappingOnly(GuestRIP);
++    return;
++  }
++  SMCInvalidateEvent.NotifyOne();
++}
++} // namespace
++
+ ContextImpl::ContextImpl(const FEXCore::HostFeatures& Features)
+   : HostFeatures {Features}
+   , CPUID {this}
+   , CodeCache {*this} {
++  if (const char* Env = getenv("FEX_POOL_CLONE")) {
++    PoolCloneModeValue = atoi(Env);
++  }
+   if (!Config.Is64BitMode()) {
+     // When operating in 32-bit mode, the virtual memory we care about is only the lower 32-bits.
+     Config.VirtualMemSize = 1ULL << 32;
+@@ -488,12 +597,295 @@ void ContextImpl::OnCodeBufferAllocated(const fextl::shared_ptr<CPU::CodeBuffer>
+ 
+   {
+     std::scoped_lock lk {CodeBufferListLock};
++    // Overflow buffers share their predecessor's map; invalidating it once is enough.
++    if (!CodeBufferList.empty()) {
++      if (auto Last = CodeBufferList.back().lock(); Last && Last->LookupCache == Buffer->LookupCache) {
++        return;
++      }
++    }
+     CodeBufferList.emplace_back(Buffer);
+   }
+ }
+ 
++extern "C" {
++uint64_t fh6_stats[55] {};
++uint64_t fh6_pool_keys[65536] {};
++uint64_t fh6_clone_bad_info[4] {};
++uint8_t fh6_clone_bad[2][1024] {};
++uint64_t fh6_shape[64][10] {};
++uint64_t fh6_shape_tick {};
++uint64_t fh6_smc[4096][3] {};
++uint64_t fh6_exc[256][4] {};
++uint64_t (*fh6_blockmap)[2] {};
++uint64_t fh6_blockmap_count {};
++}
++
++namespace {
++constexpr uint64_t MaxX86InstSize = 15;
++
++// Trampoline pools keep rewriting slots with "one instruction; jmp rel32" stubs whose instruction and
++// absolute jump target recur at other slots. Such a translation depends on its address only through
++// relocated constants: entry-relative RIPs move with the slot, the jump target stays, and the entry CRC
++// covers the slot bytes. FEX_POOL_CLONE: 0 off, 1 (default) publish copies, 2 build copies and compare
++// them with a fresh compile without using them.
++
++struct PoolTemplate {
++  uint64_t Entry;
++  uint64_t Target;
++  uint32_t InsnLen;
++  uint32_t EntryOffset;
++  bool Writable;
++  std::array<uint8_t, MaxX86InstSize> Insn;
++  fextl::vector<uint8_t> Host;
++  fextl::vector<FEXCore::CPU::Relocation> Relocs;
++};
++
++struct PoolTemplateShard {
++  std::mutex Mutex;
++  fextl::unordered_map<uint64_t, fextl::shared_ptr<const PoolTemplate>> Map;
++};
++constexpr size_t PoolShards = 128;
++constexpr size_t PoolShardLimit = 512;
++PoolTemplateShard PoolTemplates[PoolShards];
++
++std::atomic<uint32_t> PoolVerifyTick {};
++
++uint64_t PoolKey(const uint8_t* Insn, uint64_t Len, uint64_t Target) {
++  uint64_t Key = 0x9E3779B97F4A7C15ULL ^ Target;
++  for (uint64_t i = 0; i < Len; ++i) {
++    Key = (Key ^ Insn[i]) * 0x100000001B3ULL;
++  }
++  Key = (Key ^ (Key >> 29)) * 0xBF58476D1CE4E5B9ULL;
++  return Key ^ (Key >> 32);
++}
++
++uint64_t PoolJmpTarget(const uint8_t* Code, uint64_t Entry, uint64_t InsnLen) {
++  int32_t Rel;
++  memcpy(&Rel, Code + InsnLen + 1, sizeof(Rel));
++  return Entry + InsnLen + 5 + static_cast<int64_t>(Rel);
++}
++
++fextl::shared_ptr<const PoolTemplate> FindPoolTemplate(uint64_t Key) {
++  auto& Shard = PoolTemplates[Key % PoolShards];
++  std::scoped_lock Lock(Shard.Mutex);
++  auto It = Shard.Map.find(Key);
++  return It == Shard.Map.end() ? nullptr : It->second;
++}
++
++void StorePoolTemplate(uint64_t Key, fextl::shared_ptr<const PoolTemplate> Template) {
++  auto& Shard = PoolTemplates[Key % PoolShards];
++  std::scoped_lock Lock(Shard.Mutex);
++  if (Shard.Map.size() >= PoolShardLimit) {
++    Shard.Map.clear();
++  }
++  Shard.Map[Key] = std::move(Template);
++}
++
++// Value of a padded 64-bit constant load (movz/movk/nop), as emitted for relocatable constants.
++std::optional<uint64_t> ReadPaddedConstant(const uint8_t* Code) {
++  uint64_t Value = 0;
++  bool Any = false;
++  for (int i = 0; i < 4; ++i) {
++    uint32_t Inst;
++    memcpy(&Inst, Code + i * 4, sizeof(Inst));
++    if (Inst == 0xD503201F) {
++      continue;
++    }
++    const uint32_t Op = Inst & 0xFF800000;
++    if (Op != 0xD2800000 && Op != 0xF2800000) {
++      return std::nullopt;
++    }
++    const uint32_t Shift = ((Inst >> 21) & 3) * 16;
++    const uint64_t Imm = (Inst >> 5) & 0xFFFF;
++    Value = (Op == 0xD2800000 ? 0 : Value & ~(0xFFFFULL << Shift)) | (Imm << Shift);
++    Any = true;
++  }
++  return Any ? std::optional<uint64_t>(Value) : std::nullopt;
++}
++
++// What the disk cache would patch in for a patchable relocation, computed from a snapshot of the slot
++// at Entry instead of live memory. Offset is the site's offset in the slot.
++uint64_t PoolPatchableValue(CPU::RelocationTypes Type, uint64_t Offset, uint64_t Entry, uint8_t Size, const uint8_t* Snapshot) {
++  if (Type == CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_CRC_MOVE) {
++    return FEXCore::Utils::crc32(Snapshot + Offset, Size);
++  }
++  uint64_t Raw = 0;
++  memcpy(&Raw, Snapshot + Offset, Size);
++  const int64_t Data = Size == 1 ? int64_t(int8_t(Raw)) : Size == 2 ? int64_t(int16_t(Raw)) : Size == 4 ? int64_t(int32_t(Raw)) : int64_t(Raw);
++  if (Type == CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_DATA_MOVE) {
++    return Data;
++  }
++  return Entry + Offset + Size + Data;
++}
++
++bool PatchPoolCopy(ContextImpl* CTX, const PoolTemplate& Template, uint64_t NewEntry, const uint8_t* Snapshot, uint8_t* Out) {
++  memcpy(Out, Template.Host.data(), Template.Host.size());
++  CPU::Arm64Emitter Emitter(CTX, Out, Template.Host.size());
++  const auto Move = [&](uint64_t Old) {
++    return Old == Template.Target ? Old : Old - Template.Entry + NewEntry;
++  };
++  for (const auto& Reloc : Template.Relocs) {
++    Emitter.SetCursorOffset(Reloc.Header.Offset);
++    switch (Reloc.Header.Type) {
++    case CPU::RelocationTypes::RELOC_NAMED_SYMBOL_LITERAL:
++    case CPU::RelocationTypes::RELOC_NAMED_THUNK_MOVE: break;
++    case CPU::RelocationTypes::RELOC_GUEST_RIP_LITERAL: Emitter.dc64(Move(Reloc.GuestRIP.GuestRIP)); break;
++    case CPU::RelocationTypes::RELOC_GUEST_RIP_MOVE:
++      Emitter.LoadConstant(ARMEmitter::Size::i64Bit, ARMEmitter::Register(Reloc.GuestRIP.RegisterIndex), Move(Reloc.GuestRIP.GuestRIP),
++                           CPU::Arm64Emitter::PadType::DOPAD);
++      break;
++    case CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_CRC_MOVE:
++    case CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_DATA_MOVE:
++    case CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_RIP_MOVE:
++    case CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_RIP_LITERAL: {
++      const auto& Data = Reloc.GuestPatchableData;
++      const uint64_t Value = PoolPatchableValue(Reloc.Header.Type, Data.SiteAddress - Template.Entry, NewEntry, Data.ValueSize, Snapshot);
++      if (Reloc.Header.Type == CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_RIP_LITERAL) {
++        Emitter.dc64(Value);
++      } else {
++        Emitter.LoadConstant(ARMEmitter::Size::i64Bit, ARMEmitter::Register(Data.RegisterIndex), Value, CPU::Arm64Emitter::PadType::DOPAD);
++      }
++      break;
++    }
++    default: return false;
++    }
++  }
++  return true;
++}
++
++// Builds a template from a fresh compile of a pool stub, or returns null if the block isn't one.
++// The guest bytes are re-read here, so the embedded entry CRC must match them: otherwise the slot was
++// rewritten after decoding and the code belongs to other bytes.
++fextl::shared_ptr<PoolTemplate> MakePoolTemplate(const Frontend::Decoder::DecodedBlockInformation& BlockInfo, uint64_t GuestRIP,
++                                                 uint64_t Length, bool Writable, const CPU::CPUBackend::CompiledCode& Code,
++                                                 std::span<const CPU::Relocation> Relocs) {
++  const auto Reject = [](FH6Stats::Counter Reason) -> fextl::shared_ptr<PoolTemplate> {
++    FH6Stats::Add(Reason);
++    return nullptr;
++  };
++  if (!Writable) {
++    return Reject(FH6Stats::PoolRejectNotWritable);
++  }
++  if (BlockInfo.Blocks.size() != 1 || Code.EntryPoints.size() != 1) {
++    return Reject(FH6Stats::PoolRejectShape);
++  }
++  const auto& Block = BlockInfo.Blocks[0];
++  if (Block.Entry != GuestRIP || Block.Size != Length || Block.ForceFullSMCDetection) {
++    return Reject(FH6Stats::PoolRejectShape);
++  }
++  // A lone ret: no jump target, so Target stays 0 and nothing in the copy is kept fixed.
++  const bool RetStub = Block.NumInstructions == 1 && Length == 1;
++  uint64_t InsnLen = 1;
++  if (!RetStub) {
++    if (Block.NumInstructions != 2) {
++      return Reject(FH6Stats::PoolRejectShape);
++    }
++    const auto& Insn = Block.DecodedInstructions[0];
++    const auto& Jmp = Block.DecodedInstructions[1];
++    InsnLen = Insn.InstSize;
++    if (InsnLen == 0 || InsnLen > MaxX86InstSize || Jmp.InstSize != 5 || InsnLen + 5 != Length) {
++      return Reject(FH6Stats::PoolRejectShape);
++    }
++    if (Insn.TableInfo == nullptr ||
++        (Insn.TableInfo->Flags & (X86Tables::InstFlags::FLAGS_BLOCK_END | X86Tables::InstFlags::FLAGS_SETS_RIP | X86Tables::InstFlags::FLAGS_CALL))) {
++      return Reject(FH6Stats::PoolRejectInsn);
++    }
++    const auto RipRelative = [](const X86Tables::DecodedOperand& Operand) {
++      return Operand.IsRIPRelative() || Operand.IsRIPRelativeRelocation();
++    };
++    if (RipRelative(Insn.Dest) || RipRelative(Insn.Src[0]) || RipRelative(Insn.Src[1]) || RipRelative(Insn.Src[2])) {
++      return Reject(FH6Stats::PoolRejectInsn);
++    }
++  }
++
++  std::array<uint8_t, MaxX86InstSize + 5> Snapshot;
++  memcpy(Snapshot.data(), reinterpret_cast<const void*>(GuestRIP), Length);
++  uint64_t Target = 0;
++  if (RetStub) {
++    if (Snapshot[0] != 0xC3) {
++      return Reject(FH6Stats::PoolRejectBytes);
++    }
++  } else {
++    if (Snapshot[InsnLen] != 0xE9) {
++      return Reject(FH6Stats::PoolRejectBytes);
++    }
++    Target = PoolJmpTarget(Snapshot.data(), GuestRIP, InsnLen);
++    if (Target >= GuestRIP - 32 && Target < GuestRIP + Length + 32) {
++      return Reject(FH6Stats::PoolRejectBytes);
++    }
++  }
++
++  const auto EntryHost = Code.EntryPoints.begin()->second;
++  auto Template = fextl::make_shared<PoolTemplate>();
++  Template->Entry = GuestRIP;
++  Template->Target = Target;
++  Template->InsnLen = InsnLen;
++  Template->EntryOffset = EntryHost - Code.BlockBegin;
++  Template->Writable = Writable;
++  memcpy(Template->Insn.data(), Snapshot.data(), InsnLen);
++  Template->Host.assign(Code.BlockBegin, Code.BlockBegin + Code.Size);
++
++  bool HasCrc = false;
++  for (const auto& Reloc : Relocs) {
++    const bool Literal = Reloc.Header.Type == CPU::RelocationTypes::RELOC_GUEST_RIP_LITERAL ||
++                         Reloc.Header.Type == CPU::RelocationTypes::RELOC_NAMED_SYMBOL_LITERAL ||
++                         Reloc.Header.Type == CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_RIP_LITERAL;
++    if (Reloc.Header.Offset + (Literal ? 8 : 16) > Code.Size) {
++      return Reject(FH6Stats::PoolRejectReloc);
++    }
++    switch (Reloc.Header.Type) {
++    case CPU::RelocationTypes::RELOC_NAMED_SYMBOL_LITERAL:
++    case CPU::RelocationTypes::RELOC_NAMED_THUNK_MOVE: break;
++    case CPU::RelocationTypes::RELOC_GUEST_RIP_LITERAL:
++    case CPU::RelocationTypes::RELOC_GUEST_RIP_MOVE: {
++      const uint64_t Value = Reloc.GuestRIP.GuestRIP;
++      if (Value != Target && (Value < GuestRIP || Value > GuestRIP + Length)) {
++        return Reject(FH6Stats::PoolRejectRelocValue);
++      }
++      if (Reloc.Header.Type == CPU::RelocationTypes::RELOC_GUEST_RIP_MOVE && ReadPaddedConstant(Template->Host.data() + Reloc.Header.Offset) != Value) {
++        return Reject(FH6Stats::PoolRejectRelocValue);
++      }
++      break;
++    }
++    case CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_CRC_MOVE:
++    case CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_DATA_MOVE:
++    case CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_RIP_MOVE:
++    case CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_RIP_LITERAL: {
++      const bool Crc = Reloc.Header.Type == CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_CRC_MOVE;
++      const uint64_t Site = Reloc.GuestPatchableData.SiteAddress;
++      const uint64_t Size = Reloc.GuestPatchableData.ValueSize;
++      if (Site < GuestRIP || Site + Size > GuestRIP + Length || (!Crc && Size != 1 && Size != 2 && Size != 4 && Size != 8)) {
++        return Reject(Crc ? FH6Stats::PoolRejectCrc : FH6Stats::PoolRejectReloc);
++      }
++      const uint64_t Expected = PoolPatchableValue(Reloc.Header.Type, Site - GuestRIP, GuestRIP, Size, Snapshot.data());
++      std::optional<uint64_t> Embedded;
++      if (Reloc.Header.Type == CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_RIP_LITERAL) {
++        uint64_t Lit;
++        memcpy(&Lit, Template->Host.data() + Reloc.Header.Offset, sizeof(Lit));
++        Embedded = Lit;
++      } else {
++        Embedded = ReadPaddedConstant(Template->Host.data() + Reloc.Header.Offset);
++      }
++      if (!Embedded || *Embedded != Expected) {
++        return Reject(Crc ? FH6Stats::PoolRejectCrc : FH6Stats::PoolRejectRelocValue);
++      }
++      HasCrc |= Crc;
++      break;
++    }
++    default: return Reject(FH6Stats::PoolRejectReloc);
++    }
++  }
++  if (!HasCrc) {
++    return Reject(FH6Stats::PoolRejectCrc);
++  }
++  Template->Relocs.assign(Relocs.begin(), Relocs.end());
++  return Template;
++}
++} // namespace
++
+ void ContextImpl::ClearCodeCache(FEXCore::Core::InternalThreadState* Thread, bool NewCodeBuffer) {
+   FEXCORE_PROFILE_INSTANT("ClearCodeCache");
++  FEXCore::FH6Stats::Add(NewCodeBuffer ? FEXCore::FH6Stats::ClearCacheNewBuffer : FEXCore::FH6Stats::ClearCacheKeepBuffer);
+ 
+   if (NewCodeBuffer) {
+     // Allocate new CodeBuffer + L3 LookupCache and clear L1+L2 caches
+@@ -529,7 +921,7 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
+ 
+   bool HasCustomIR {};
+ 
+-  bool WantsDiskCachePatching = DiskCache.IsReadingDiskCache() || DiskCache.IsWritingDiskCache();
++  bool WantsDiskCachePatching = DiskCache.IsReadingDiskCache() || DiskCache.IsWritingDiskCache() || Thread->PoolPatchable;
+ 
+   if (HasCustomIRHandlers.load(std::memory_order_relaxed)) {
+     std::shared_lock lk(CustomIRMutex);
+@@ -629,8 +1021,11 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
+           Thread->OpDispatcher->SetTrueJumpTarget(mismatch, fail);
+           Thread->OpDispatcher->SetCurrentCodeBlock(fail);
+           Thread->OpDispatcher->StartNewBlock();
+-          Thread->OpDispatcher->_ThreadRemoveCodeEntry(Thread->OpDispatcher->_EntrypointOffset(GPRSize, 0),
+-                                                        Thread->OpDispatcher->_EntrypointOffset(GPRSize, Block.Entry - GuestRIP));
++          // GitHub: invalidate the function entry (offset 0), not the failing
++          // block. Dispatcher waits out UD2 on the chunk then always C++ this
++          // entry. Skip-C++ after that wait (hbge) died_after_drive.
++          auto EntryRip = Thread->OpDispatcher->_EntrypointOffset(GPRSize, 0);
++          Thread->OpDispatcher->_ThreadRemoveCodeEntry(EntryRip, addr, Thread->OpDispatcher->Constant(0));
+           auto next = Thread->OpDispatcher->CreateNewCodeBlockAfter(current);
+           Thread->OpDispatcher->SetFalseJumpTarget(mismatch, next);
+           Thread->OpDispatcher->SetCurrentCodeBlock(next);
+@@ -708,7 +1103,7 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
+           auto EntryToInvalidate = Thread->OpDispatcher->_EntrypointOffset(GPRSize, 0);
+           auto NewRIP = Thread->OpDispatcher->_EntrypointOffset(GPRSize, InstAddress - GuestRIP);
+           // Invalidate and exit the function
+-          Thread->OpDispatcher->_ThreadRemoveCodeEntry(EntryToInvalidate, NewRIP);
++          Thread->OpDispatcher->_ThreadRemoveCodeEntry(EntryToInvalidate, NewRIP, Thread->OpDispatcher->Constant(0));
+ 
+           auto NextOpBlock = Thread->OpDispatcher->CreateNewCodeBlockAfter(CurrentBlock);
+ 
+@@ -918,10 +1313,83 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
+   if (auto HostCode = Thread->LookupCache->FindBlock(Thread, GuestRIP)) {
+     return HostCode;
+   }
++  {
++    uint64_t Reused = 0;
++    if (Thread->LookupCache->TryReuseAfterSMC(GuestRIP, &Reused) == 1) {
++      return Reused;
++    }
++  }
++  FEXCore::FH6Stats::Add(FEXCore::FH6Stats::CompileBlockMiss);
++
++  std::optional<ExecutableFileSectionInfo> Region = SyscallHandler->LookupExecutableFileSection(Thread, GuestRIP);
++
++  const bool TFSet = Thread->CurrentFrame->State.flags[X86State::RFLAG_TF_RAW_LOC];
++  HLE::ExecutableRangeInfo RangeInfo {};
++  if (PoolCloneModeValue != 0 && !Region && MaxInst == 0 && !TFSet) {
++    RangeInfo = SyscallHandler->QueryGuestExecutableRange(Thread, GuestRIP);
++  }
++  const bool PoolCandidate = RangeInfo.Size != 0;
++  auto& PoolCopy = Thread->PoolCopy;
++  auto& PoolCopySize = Thread->PoolCopySize;
++  PoolCopySize = 0;
++  if (PoolCandidate) {
++    // One snapshot of the slot: the template match and the entry CRC must describe the same bytes.
++    std::array<uint8_t, MaxX86InstSize + 5> Snapshot;
++    const uint64_t RangeEnd = RangeInfo.Base + RangeInfo.Size;
++    const uint64_t Avail = RangeEnd > GuestRIP ? std::min<uint64_t>(Snapshot.size(), RangeEnd - GuestRIP) : 0;
++    memcpy(Snapshot.data(), reinterpret_cast<const void*>(GuestRIP), Avail);
++    // {InsnLen, Target}: a lone ret (Target 0), or one instruction followed by jmp rel32.
++    std::array<std::pair<uint64_t, uint64_t>, MaxX86InstSize + 1> Candidates;
++    size_t NumCandidates = 0;
++    if (Avail >= 1 && Snapshot[0] == 0xC3) {
++      Candidates[NumCandidates++] = {1, 0};
++    }
++    for (uint64_t InsnLen = 1; InsnLen <= MaxX86InstSize && InsnLen + 5 <= Avail; ++InsnLen) {
++      if (Snapshot[InsnLen] == 0xE9) {
++        Candidates[NumCandidates++] = {InsnLen, PoolJmpTarget(Snapshot.data(), GuestRIP, InsnLen)};
++      }
++    }
++    for (size_t Candidate = 0; Candidate < NumCandidates; ++Candidate) {
++      const auto [InsnLen, Target] = Candidates[Candidate];
++      const auto Template = FindPoolTemplate(PoolKey(Snapshot.data(), InsnLen, Target));
++      if (!Template || Template->InsnLen != InsnLen || Template->Target != Target || Template->Writable != RangeInfo.Writable ||
++          memcmp(Template->Insn.data(), Snapshot.data(), InsnLen) != 0) {
++        continue;
++      }
++      if (Template->Host.size() > sizeof(PoolCopy) || !PatchPoolCopy(this, *Template, GuestRIP, Snapshot.data(), PoolCopy)) {
++        break;
++      }
++      PoolCopySize = Template->Host.size();
++      // Mode 1 still checks one copy in 256 against a fresh compile.
++      if (PoolCloneModeValue == 2 || (PoolVerifyTick.fetch_add(1, std::memory_order_relaxed) & 255) == 0) {
++        break;
++      }
++      const uint32_t CopySize = PoolCopySize;
++      PoolCopySize = 0;
++      const auto Loaded = Thread->CPUBackend->LoadCachedCode({PoolCopy, CopySize});
++      if (!Loaded.BlockBegin) {
++        break;
++      }
++      const std::array<uint64_t, 1> Entry {GuestRIP};
++      const uint64_t LastByte = GuestRIP + InsnLen + (Target ? 5 : 0) - 1;
++      const std::array<uint64_t, 2> Pages {GuestRIP & FEXCore::Utils::FEX_PAGE_MASK, LastByte & FEXCore::Utils::FEX_PAGE_MASK};
++      const size_t NumPages = Pages[0] == Pages[1] ? 1 : 2;
++      for (size_t i = 0; i < NumPages; ++i) {
++        if (Thread->LookupCache->AddBlockExecutableRange(Thread, Entry, Pages[i], FEXCore::Utils::FEX_PAGE_SIZE)) {
++          SyscallHandler->MarkGuestExecutableRange(Thread, Pages[i], FEXCore::Utils::FEX_PAGE_SIZE);
++        }
++      }
++      void* Host = Loaded.BlockBegin + Template->EntryOffset;
++      Thread->LookupCache->AddBlockMapping(Thread, GuestRIP, std::span<const uint64_t>(Pages.data(), NumPages), Host);
++      FEXCore::FH6Stats::NoteBlock(GuestRIP, reinterpret_cast<uint64_t>(Host));
++      FEXCore::FH6Stats::Add(FEXCore::FH6Stats::PoolCloneHits);
++      FEXCore::FH6Stats::Add(FEXCore::FH6Stats::JITHostBytes, CopySize);
++      return reinterpret_cast<uintptr_t>(Host);
++    }
++  }
+ 
+   Thread->FrontendDecoder->SetupDecodeInstructionsAtEntry(Thread, GuestRIP, MaxInst);
+ 
+-  std::optional<ExecutableFileSectionInfo> Region = SyscallHandler->LookupExecutableFileSection(Thread, GuestRIP);
+   std::optional<DiskCache::CodeHitData> Hit;
+   std::optional<uint64_t> DiskCacheGuestCodeKey;
+   {
+@@ -950,6 +1418,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
+         LOGMAN_THROW_A_FMT(CachedHostCode != 0, "Couldn't find GuestRIP in Disk Cache entrypoints!");
+ 
+         FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedDiskCacheHitCount, 1);
++        FEXCore::FH6Stats::Add(FEXCore::FH6Stats::DiskCacheHits);
+         Thread->FrontendDecoder->DelayedDisownBuffer();
+ 
+         Thread->FrontendDecoder->ValidateDisownedOrFree();
+@@ -962,15 +1431,25 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
+ 
+   // Accumulate a JIT count now, as even if another thread raced us, it should count as a compile.
+   FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedJITCount, 1);
++  FEXCore::FH6Stats::Add(FEXCore::FH6Stats::JITCompiles);
+ 
++  const uint64_t CompileStart = FEXCore::FH6Stats::Ticks();
++  Thread->PoolPatchable = PoolCandidate;
++  Thread->CPUBackend->SetRelocatablePadding(PoolCandidate);
+   auto [CompiledCode, DebugData, StartAddr, Length, NeedsAddGuestCodeRanges] = CompileCode(Thread, GuestRIP, MaxInst);
++  Thread->PoolPatchable = false;
++  Thread->CPUBackend->SetRelocatablePadding(false);
++  FEXCore::FH6Stats::Add(FEXCore::FH6Stats::JITCompileTicks, FEXCore::FH6Stats::Ticks() - CompileStart);
+   auto CodePtr = CompiledCode.EntryPoints[GuestRIP];
+   if (CodePtr == nullptr) {
+     return 0;
+   } else if (!DebugData) {
+     // DebugData wasn't populated, indicating another thread raced us for compiling this block
++    FEXCore::FH6Stats::Add(FEXCore::FH6Stats::RacedCompiles);
+     return reinterpret_cast<uintptr_t>(CodePtr);
+   }
++  FEXCore::FH6Stats::Add(FEXCore::FH6Stats::JITGuestBytes, Length);
++  FEXCore::FH6Stats::Add(FEXCore::FH6Stats::JITHostBytes, CompiledCode.Size);
+ 
+   if (DiskCacheGuestCodeKey && Hit && DiskCache.IsValidating()) {
+     DiskCache.Validate(*DiskCacheGuestCodeKey, *Hit, CompiledCode, Region);
+@@ -1051,9 +1530,37 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
+     }
+   }
+ 
++  if (!Region) {
++    FEXCore::FH6Stats::NotePoolCompile(reinterpret_cast<const uint8_t*>(StartAddr), Length);
++  }
++  if (!Region && !(PoolCandidate && NeedsAddGuestCodeRanges)) {
++    FEXCore::FH6Stats::Add(FEXCore::FH6Stats::PoolRejectNotCandidate);
++  }
++  if (PoolCandidate && NeedsAddGuestCodeRanges) {
++    if (PoolCopySize) {
++      if (PoolCopySize == CompiledCode.Size && memcmp(PoolCopy, CompiledCode.BlockBegin, CompiledCode.Size) == 0) {
++        FEXCore::FH6Stats::Add(FEXCore::FH6Stats::PoolVerifyOK);
++      } else {
++        FEXCore::FH6Stats::Add(FEXCore::FH6Stats::PoolVerifyBad);
++        FEXCore::FH6Stats::NoteCloneMismatch(GuestRIP, PoolCopy, PoolCopySize, CompiledCode.BlockBegin, CompiledCode.Size);
++      }
++      PoolCopySize = 0;
++    }
++    std::span<const CPU::Relocation> Relocs;
++    if (DebugData->Relocations) {
++      Relocs = *DebugData->Relocations;
++    }
++    if (auto Template = MakePoolTemplate(*Thread->FrontendDecoder->GetDecodedBlockInfo(), GuestRIP, Length, RangeInfo.Writable, CompiledCode, Relocs)) {
++      const uint64_t Key = PoolKey(Template->Insn.data(), Template->InsnLen, Template->Target);
++      StorePoolTemplate(Key, std::move(Template));
++      FEXCore::FH6Stats::Add(FEXCore::FH6Stats::PoolTemplatesStored);
++    }
++  }
++
+   // Insert to lookup cache
+   for (auto [GuestAddr, HostAddr] : CompiledCode.EntryPoints) {
+     Thread->LookupCache->AddBlockMapping(Thread, GuestAddr, CodePages, HostAddr);
++    FEXCore::FH6Stats::NoteBlock(GuestAddr, reinterpret_cast<uint64_t>(HostAddr));
+   }
+ 
+   // Clear any relocations that might have been generated
+@@ -1093,6 +1600,7 @@ bool ContextImpl::InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length
+   FEXCORE_PROFILE_SCOPED("InvalidateCodeBuffersCodeRange");
+ 
+   LOGMAN_THROW_A_FMT(CodeInvalidationMutex.try_lock() == false, "CodeInvalidationMutex needs to be unique_locked here");
++  const uint64_t InvalidateStart = FEXCore::FH6Stats::Ticks();
+   bool HadCode = false;
+   std::scoped_lock lk {CodeBufferListLock};
+   auto it = CodeBufferList.begin();
+@@ -1104,6 +1612,8 @@ bool ContextImpl::InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length
+       it = CodeBufferList.erase(it);
+     }
+   }
++  FEXCore::FH6Stats::Add(FEXCore::FH6Stats::IntervalInvalidate);
++  FEXCore::FH6Stats::Add(FEXCore::FH6Stats::IntervalInvalidateTicks, FEXCore::FH6Stats::Ticks() - InvalidateStart);
+   return HadCode;
+ }
+ 
+@@ -1147,11 +1657,15 @@ void ContextImpl::ThreadRemoveCodeEntryFromJit(FEXCore::Core::CpuStateFrame* Fra
+   auto Thread = Frame->Thread;
+   auto CTX = static_cast<ContextImpl*>(Thread->CTX);
+ 
++  FEXCore::FH6Stats::Add(FEXCore::FH6Stats::SMCMismatch);
++  FEXCore::FH6Stats::NoteSMC(GuestRIP & ~0xFFFULL, GuestRIP);
++  FEXCore::FH6Stats::NoteShape(GuestRIP, 0, 0, 0, std::min<uint64_t>(32, 0x1000 - (GuestRIP & 0xFFF)), 0);
++
+   if (CTX->Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL) {
+     // Every block compiled from writable code validates its own bytes on entry, so a thread that
+     // reaches a stale copy through its own cache, an older buffer's links, or a racing link detects
+     // the mismatch itself and erases it from the map it looks up in. Drop only this thread's block.
+-    Thread->LookupCache->InvalidateBlock(GuestRIP);
++    QueueSMCInvalidate(Thread, GuestRIP);
+     return;
+   }
+ 
+diff --git a/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp b/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
+index 2f4babd70..19641dbf7 100644
+--- a/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
+@@ -555,6 +555,11 @@ void Dispatcher::EmitDispatcher() {
+     // It's also the end of block and RIP might have changed, so we jump directly to the top of the loop.
+     ThreadDispatchRemoveCodeEntry = GetCursorAddress<uint64_t>();
+ 
++    // GitHub: always InvalidateBlock(function entry). RIP is the failing
++    // chunk so LoopTop re-enters the cached original host instead of
++    // compiling from the entry (hbgh2).
++    ARMEmitter::ForwardLabel AfterFill;
++
+     // Arguments are already in x0, x1. Just jump to the handler.
+     ldr(ARMEmitter::XReg::x2, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.ThreadRemoveCodeEntryFromJIT));
+     if (!CTX->Config.DisableVixlIndirectCalls) [[unlikely]] {
+@@ -562,11 +567,11 @@ void Dispatcher::EmitDispatcher() {
+     } else {
+       blr(ARMEmitter::Reg::r2);
+     }
+-
+     FillStaticRegs({
+       .OptionalReg = ARMEmitter::Reg::r1,
+       .OptionalReg2 = ARMEmitter::Reg::r2,
+     });
++    (void)Bind(&AfterFill);
+ 
+     // Now go back to the regular dispatcher loop
+     (void)b(&LoopTop);
+diff --git a/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp b/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp
+index c2b1d8e28..a4b3ccbaf 100644
+--- a/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp
+@@ -364,30 +364,83 @@ DEF_OP(ValidateCode) {
+ 
+   sub(ARMEmitter::Size::i32Bit, Dst, TMP1, CRC32Reg);
+ 
+-  ARMEmitter::ForwardLabel End;
+-  cbz_OrRestart(ARMEmitter::Size::i32Bit, Dst, &End);
++  ARMEmitter::ForwardLabel Match, End;
++  cbz_OrRestart(ARMEmitter::Size::i32Bit, Dst, &Match);
+ 
+   LoadConstant(ARMEmitter::Size::i32Bit, Dst, 1);
++  b_OrRestart(&End);
++  BindOrRestart(&Match);
++  str(ARMEmitter::XReg::zr, STATE, offsetof(FEXCore::Core::CpuStateFrame, LastSMCInvalidateRIP));
+   BindOrRestart(&End);
+ }
+ 
+ DEF_OP(ThreadRemoveCodeEntry) {
+   auto Op = IROp->C<IR::IROp_ThreadRemoveCodeEntry>();
+ 
+-  SpillStaticRegs(TMP1);
++  // Fast path: this thread already queued this entry. SRA stays live. Still
++  // poke L1+L2 of the ENTRY (not the chunk) so title LoopTop misses and
++  // compiles the rewrite (hbfastq 550ms-stalled with L2 still live). Do not
++  // use x2 (SRA / guest RDX).
++  ARMEmitter::ForwardLabel Slow, SkipL1, SkipL2;
++  mov(ARMEmitter::Size::i64Bit, TMP1, GetReg(Op->EntryToInvalidate));
++  mov(ARMEmitter::Size::i64Bit, TMP2, GetReg(Op->NewRIP));
++  // Title occupancy is chunk 0 of the function (entry == RIP). Fast path
++  // LoopTop then CompileBlock with SRA live (hbfastl1 550ms). In-world the
++  // failing chunk is not the entry.
++  cmp(ARMEmitter::Size::i64Bit, TMP1, TMP2);
++  b_OrRestart(ARMEmitter::Condition::CC_EQ, &Slow);
++  ldr(TMP3, STATE, offsetof(FEXCore::Core::CpuStateFrame, LastSMCInvalidateRIP));
++  cmp(ARMEmitter::Size::i64Bit, TMP1, TMP3);
++  b_OrRestart(ARMEmitter::Condition::CC_NE, &Slow);
++  str(TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.rip));
++
++  ldp<ARMEmitter::IndexType::OFFSET>(TMP3, TMP4, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.L1Pointer));
++  and_(ARMEmitter::Size::i64Bit, TMP4, TMP4, TMP1.R(), ARMEmitter::ShiftType::LSL,
++       FEXCore::ilog2(sizeof(FEXCore::LookupCache::LookupCacheEntry)));
++  add(TMP3, TMP3, TMP4);
++  ldr(TMP4, TMP3, 8);
++  cmp(ARMEmitter::Size::i64Bit, TMP4, TMP1);
++  b_OrRestart(ARMEmitter::Condition::CC_NE, &SkipL1);
++  str(ARMEmitter::XReg::zr, TMP3, 8);
++  BindOrRestart(&SkipL1);
++
++  ldr(TMP3, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.L2Pointer));
++  cbz_OrRestart(ARMEmitter::Size::i64Bit, TMP3, &SkipL2);
++  {
++    const uint64_t VirtualMemorySize = CTX->Config.VirtualMemSize;
++    if (std::popcount(VirtualMemorySize) == 1) {
++      and_(ARMEmitter::Size::i64Bit, TMP4, TMP1, VirtualMemorySize - 1);
++    } else {
++      LoadConstant(ARMEmitter::Size::i64Bit, TMP4, VirtualMemorySize);
++      and_(ARMEmitter::Size::i64Bit, TMP4, TMP1, TMP4);
++    }
++  }
++  lsr(ARMEmitter::Size::i64Bit, TMP2, TMP4, 12);
++  ldr(TMP3, TMP3, TMP2, ARMEmitter::ExtendedType::LSL_64, 3);
++  cbz_OrRestart(ARMEmitter::Size::i64Bit, TMP3, &SkipL2);
++  and_(ARMEmitter::Size::i64Bit, TMP2, TMP4, 0x0FFF);
++  add(TMP3, TMP3, TMP2, ARMEmitter::ShiftType::LSL, FEXCore::ilog2(sizeof(FEXCore::LookupCache::LookupCacheEntry)));
++  stp<ARMEmitter::IndexType::OFFSET>(ARMEmitter::XReg::zr, ARMEmitter::XReg::zr, TMP3, 0);
++  BindOrRestart(&SkipL2);
++
++  ldr(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.DispatcherLoopTop));
++  br(TMP1);
+ 
+-  // Store the new RIP to go to.
+-  str(GetReg(Op->NewRIP).X(), STATE, offsetof(FEXCore::Core::CpuStateFrame, State.rip));
++  BindOrRestart(&Slow);
++  // Copy before spill: TMP1 (x10) is the spill scratch. x12/x13/x14 are not SRA.
++  mov(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r12, GetReg(Op->EntryToInvalidate));
++  mov(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r13, GetReg(Op->NewRIP));
++  mov(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r14, GetReg(Op->PackedCRC));
+ 
+-  // Move the entry to ABI before saving state.
+-  mov(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r1, GetReg(Op->EntryToInvalidate));
++  SpillStaticRegs(TMP1);
+ 
+-  // Arguments are passed as follows:
+-  // X0: Thread
+-  // X1: RIPToInvalidate
++  // GitHub: resume at the failing chunk (NewRIP), invalidate the function entry.
++  // hbgh2 stored the entry in RIP and compiled the rewrite from the top.
++  str(ARMEmitter::XReg::x13, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.rip));
++  mov(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r1, ARMEmitter::Reg::r12);
++  mov(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r10, ARMEmitter::Reg::r13);
+   mov(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r0, STATE.R());
+ 
+-  // Jump to the invalidate dispatch handler. We won't return after this.
+   ldr(ARMEmitter::XReg::x2, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.ThreadDispatchRemoveCodeEntry));
+   br(ARMEmitter::XReg::x2);
+ }
+diff --git a/FEXCore/Source/Interface/Core/JIT/JIT.cpp b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+index ef7e33299..7ed184371 100644
+--- a/FEXCore/Source/Interface/Core/JIT/JIT.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+@@ -32,8 +32,10 @@ $end_info$
+ #include <FEXCore/Utils/Profiler.h>
+ #include <FEXCore/Utils/Telemetry.h>
+ #include <FEXCore/Utils/TypeDefines.h>
++#include <FEXCore/Utils/FH6Stats.h>
+ #include <FEXCore/HLE/SyscallHandler.h>
+ 
++#include <algorithm>
+ #include <cstdio>
+ #include <cstring>
+ #include <optional>
+@@ -532,12 +534,11 @@ void Arm64JITCore::Op_Unhandled(const IR::IROp_Header* IROp, IR::Ref Node) {
+   }
+ }
+ 
+-static void DirectBlockDelinker(FEXCore::Context::ExitFunctionLinkData* Record, bool Call) {
++[[maybe_unused]] static void DirectBlockDelinker(FEXCore::Context::ExitFunctionLinkData* Record, bool Call) {
+   uintptr_t JumpThunkStartAddress = reinterpret_cast<uintptr_t>(Record) - 0x10;
+   uintptr_t CallerAddress = JumpThunkStartAddress + Record->CallerOffset;
+   auto BranchOffset = JumpThunkStartAddress / 4 - CallerAddress / 4;
+ 
+-  // Replace the patched callsite with a branch to the jump thunk.
+   uint32_t BranchInst = 0;
+   ARMEmitter::Emitter BranchEmit(reinterpret_cast<uint8_t*>(&BranchInst), 4);
+   if (Call) {
+@@ -551,16 +552,15 @@ static void DirectBlockDelinker(FEXCore::Context::ExitFunctionLinkData* Record,
+ }
+ 
+ static void IndirectBlockDelinker(FEXCore::Context::ExitFunctionLinkData* Record) {
+-  uintptr_t JumpThunkStartAddress = reinterpret_cast<uintptr_t>(Record) - 0x10;
+-  uint32_t BranchInst = 0;
+-  ARMEmitter::Emitter BranchEmit(reinterpret_cast<uint8_t*>(&BranchInst), 4);
+-  // Restore branch +2 instructions to jump to the linker block
+-  BranchEmit.b(0x2);
+-
+-  std::atomic_ref<uint32_t>(*reinterpret_cast<uint32_t*>(JumpThunkStartAddress)).store(BranchInst, std::memory_order::relaxed);
+-  ARMEmitter::Emitter::ClearICache(reinterpret_cast<void*>(JumpThunkStartAddress), 4);
+-
+-  // No need to reset HostCode here as the exit linker pointer is stored separately, and if the block is relinked it will be updated.
++  // Linked thunk is ldr TMP1, HostCode; br TMP1. Point HostCode at the
++  // thunk's own linker stub (insn +8) so incoming jumps leave without
++  // rewriting executable bytes. hbasync2 / hbrxdir / hbthunkb died on
++  // ClearICache of live JIT (caller or thunk-as-b).
++  const uintptr_t LinkerInsn = reinterpret_cast<uintptr_t>(Record) - 0x10 + 8;
++  std::atomic_ref<uint64_t>(Record->HostCode).store(LinkerInsn, std::memory_order::seq_cst);
++#if defined(ARCHITECTURE_arm64) || defined(ARCHITECTURE_arm64ec)
++  asm volatile("dc cvau, %0; dsb ish" : : "r"(&Record->HostCode) : "memory");
++#endif
+ }
+ 
+ uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEXCore::Context::ExitFunctionLinkData* Record) {
+@@ -590,14 +590,7 @@ uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEX
+     }
+   }
+ 
+-  // See ExitFunction in BranchOps.cpp for an assembly level view of the handled cases.
+   uintptr_t JumpThunkStartAddress = reinterpret_cast<uintptr_t>(Record) - 0x10;
+-  uintptr_t CallerAddress = JumpThunkStartAddress + Record->CallerOffset;
+-  auto BranchOffset = HostCode / 4 - CallerAddress / 4;
+-
+-  uint32_t ExpectedKnownCallMarkerInst = 0;
+-  ARMEmitter::Emitter ExpectedKnownCallMarkerEmit(reinterpret_cast<uint8_t*>(&ExpectedKnownCallMarkerInst), 4);
+-  ExpectedKnownCallMarkerEmit.adr(TMP1, 0xC);
+ 
+   // Guard the LookupCache lock with the code invalidation mutex, to avoid issues with forking
+   auto lk_inval = GuardSignalDeferringSection<std::shared_lock>(static_cast<Context::ContextImpl*>(Thread->CTX)->CodeInvalidationMutex, Thread);
+@@ -605,44 +598,26 @@ uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEX
+   // Lock here is necessary to prevent simultaneous linking and delinking
+   auto lk = Thread->LookupCache->AcquireWriteLock();
+ 
+-  // For non-calls, this would extend into the block's code, however that's fine as an out-of-range adr would never
+-  // be generated avoiding any false positives.
+-  uintptr_t KnownCallMarkerAddr = CallerAddress - 0x8;
+-  uint32_t KnownCallMarkerInst = *reinterpret_cast<uint32_t*>(KnownCallMarkerAddr);
+-  if (ARMEmitter::Emitter::IsInt26(BranchOffset)) {
+-    // Directly patch the callsite with the appropriate branch instruction.
+-    uint32_t BranchInst = 0;
+-    ARMEmitter::Emitter BranchEmit(reinterpret_cast<uint8_t*>(&BranchInst), 4);
+-
+-    if (KnownCallMarkerInst == ExpectedKnownCallMarkerInst) {
+-      BranchEmit.bl(BranchOffset);
+-      Thread->LookupCache->AddBlockLink(
+-        GuestRip, Record, [](FEXCore::Context::ExitFunctionLinkData* Record) { DirectBlockDelinker(Record, true); }, lk);
+-    } else {
+-      BranchEmit.b(BranchOffset);
+-      Thread->LookupCache->AddBlockLink(
+-        GuestRip, Record, [](FEXCore::Context::ExitFunctionLinkData* Record) { DirectBlockDelinker(Record, false); }, lk);
+-    }
+-
+-    std::atomic_ref<uint32_t>(*reinterpret_cast<uint32_t*>(CallerAddress)).store(BranchInst, std::memory_order::relaxed);
+-    ARMEmitter::Emitter::ClearICache(reinterpret_cast<void*>(CallerAddress), 4);
+-  } else {
+-    // This case is common between calls and jumps as the thunk callsite can be left untouched.
+-    std::atomic_ref<uint64_t>(Record->HostCode).store(HostCode, std::memory_order::seq_cst);
+-#ifdef ARCHITECTURE_arm64
+-    // Make memory write visible to other threads reading the same location
+-    asm volatile("dc cvau, %0; dsb ish" : : "r"(Record->HostCode) :);
++  // Always link through HostCode (data). Direct b/bl into live JIT is what
++  // ClearICache-delink killed on drive (hbasync2 / hbrxdir / hbthunkb). First
++  // conversion of the thunk from `b +8` to `ldr` still needs one icache flush;
++  // after that delink/relink is a pointer store.
++  std::atomic_ref<uint64_t>(Record->HostCode).store(HostCode, std::memory_order::seq_cst);
++#if defined(ARCHITECTURE_arm64) || defined(ARCHITECTURE_arm64ec)
++  asm volatile("dc cvau, %0; dsb ish" : : "r"(&Record->HostCode) : "memory");
+ #endif
+ 
+-    uint32_t LdrInst = 0;
+-    ARMEmitter::Emitter LdrEmit(reinterpret_cast<uint8_t*>(&LdrInst), 4);
+-    LdrEmit.ldr(TMP1, reinterpret_cast<uint64_t>(&Record->HostCode) - JumpThunkStartAddress);
+-    std::atomic_ref<uint32_t>(*reinterpret_cast<uint32_t*>(JumpThunkStartAddress)).store(LdrInst, std::memory_order::relaxed);
++  uint32_t LdrInst = 0;
++  ARMEmitter::Emitter LdrEmit(reinterpret_cast<uint8_t*>(&LdrInst), 4);
++  LdrEmit.ldr(TMP1, reinterpret_cast<uint64_t>(&Record->HostCode) - JumpThunkStartAddress);
++  std::atomic_ref<uint32_t> ThunkWord(*reinterpret_cast<uint32_t*>(JumpThunkStartAddress));
++  if (ThunkWord.load(std::memory_order::relaxed) != LdrInst) {
++    ThunkWord.store(LdrInst, std::memory_order::relaxed);
+     ARMEmitter::Emitter::ClearICache(reinterpret_cast<void*>(JumpThunkStartAddress), 4);
+-
+-    Thread->LookupCache->AddBlockLink(GuestRip, Record, IndirectBlockDelinker, lk);
+   }
+ 
++  Thread->LookupCache->AddBlockLink(GuestRip, Record, IndirectBlockDelinker, lk);
++
+   return HostCode;
+ }
+ 
+@@ -854,13 +829,26 @@ CodeBuffer::CodeBufferAllocation Arm64JITCore::AllocateCodeBufferInSharedCache(s
+   CodeBuffer::CodeBufferAllocation AllocatedInfo {};
+   LOGMAN_THROW_A_FMT(CurrentCodeBuffer->LookupCache.get() == ThreadState->LookupCache->Shared, "INVARIANT VIOLATED: SharedLookupCache "
+                                                                                                "doesn't match up!\n");
+-  // Bring CodeBuffer up to date
+-  if (auto Prev = CheckCodeBufferUpdate()) {
++  // Bring CodeBuffer up to date. An overflow buffer keeps the same GuestToHostMap, so only a
++  // real cache clear needs to drop this thread's L1/L2 and call-ret stack.
++  if (auto Prev = CheckCodeBufferUpdate(); Prev && Prev->LookupCache != CurrentCodeBuffer->LookupCache) {
+     Allocator::VirtualDontNeed(ThreadState->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE);
+     auto lk = ThreadState->LookupCache->AcquireWriteLock();
+     ThreadState->LookupCache->ChangeGuestToHostMapping(*Prev, *CurrentCodeBuffer->LookupCache, lk);
+   }
+ 
++  AllocatedInfo = CurrentCodeBuffer->AtomicAllocateBuffer(Size);
++  if (AllocatedInfo.BufferAllocationOffset == nullptr) {
++    // Full: continue in fresh code memory on the same map instead of discarding every translation,
++    // until the chain reaches the code budget.
++    if (auto Next = SharedCodeBuffers.StartOverflowCodeBuffer(CurrentCodeBuffer.get());
++        Next && Next->LookupCache == CurrentCodeBuffer->LookupCache) {
++      FEXCore::FH6Stats::Add(FEXCore::FH6Stats::CodeBufferOverflows);
++      CurrentCodeBuffer = std::move(Next);
++      AllocatedInfo = CurrentCodeBuffer->AtomicAllocateBuffer(Size);
++    }
++  }
++
+   // Attempt to allocate a buffer from the SharedCodeBuffers.
+   while (AllocatedInfo.BufferAllocationOffset == nullptr) {
+     AllocatedInfo = CurrentCodeBuffer->AtomicAllocateBuffer(Size);
+@@ -1199,6 +1187,10 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
+   return std::move(CodeData);
+ }
+ 
++void Arm64JITCore::SetRelocatablePadding(bool Enable) {
++  SupportCodeRelocations = Enable || CTX->RequiresRelocatableConstants();
++}
++
+ CPUBackend::CompiledCode Arm64JITCore::LoadCachedCode(std::span<const uint8_t> HostBytes) {
+   // we stored it aligned, better still be?
+   LOGMAN_THROW_A_FMT(HostBytes.size() % 16 == 0, "Needs to be 16B aligned!");
+diff --git a/FEXCore/Source/Interface/Core/JIT/JITClass.h b/FEXCore/Source/Interface/Core/JIT/JITClass.h
+index 17e76910b..0a7b5e724 100644
+--- a/FEXCore/Source/Interface/Core/JIT/JITClass.h
++++ b/FEXCore/Source/Interface/Core/JIT/JITClass.h
+@@ -63,6 +63,8 @@ public:
+     Relocations.clear();
+   }
+ 
++  void SetRelocatablePadding(bool Enable) override;
++
+ private:
+   const bool HostSupportsSVE128 {};
+   const bool HostSupportsSVE256 {};
+diff --git a/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp b/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp
+index d7b716cab..3fb25529d 100644
+--- a/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp
+@@ -179,8 +179,16 @@ DEF_OP(StoreRegister) {
+   const auto RegClass = Reg.AsRegClass();
+ 
+   if (RegClass == IR::RegClass::GPRFixed) {
+-    // Always use 64-bit, it's faster. Upper bits ignored for 32-bit mode.
+-    mov(ARMEmitter::Size::i64Bit, GetReg(Reg), GetReg(Op->Value));
++    // hbidmov: skip identity SRA copies. StorePF/StoreAF already elide
++    // src==dst. Same physical means the dump already lives in that SRA
++    // slot (exception-visible). Distinct from hbfpr/hbfps (those skipped
++    // the dump). Fast, CRC, mutex, L2 poke, PreCompile, TSO unchanged.
++    const auto Dst = GetReg(Reg);
++    const auto Src = GetReg(Op->Value);
++    if (Dst.Idx() != Src.Idx()) {
++      // Always use 64-bit, it's faster. Upper bits ignored for 32-bit mode.
++      mov(ARMEmitter::Size::i64Bit, Dst, Src);
++    }
+   } else if (RegClass == IR::RegClass::FPRFixed) {
+     const auto regSize = HostSupportsAVX256 ? IR::OpSize::i256Bit : IR::OpSize::i128Bit;
+     LOGMAN_THROW_A_FMT(IROp->Size == regSize, "expected sized");
+@@ -188,10 +196,12 @@ DEF_OP(StoreRegister) {
+     const auto guest = GetVReg(Reg);
+     const auto host = GetVReg(Op->Value);
+ 
+-    if (HostSupportsAVX256) {
+-      mov(ARMEmitter::SubRegSize::i64Bit, guest.Z(), PRED_TMP_32B.Merging(), host.Z());
+-    } else {
+-      mov(guest.Q(), host.Q());
++    if (guest.Idx() != host.Idx()) {
++      if (HostSupportsAVX256) {
++        mov(ARMEmitter::SubRegSize::i64Bit, guest.Z(), PRED_TMP_32B.Merging(), host.Z());
++      } else {
++        mov(guest.Q(), host.Q());
++      }
+     }
+   } else {
+     LOGMAN_THROW_A_FMT(false, "Unhandled Op->Class {}", RegClass);
+diff --git a/FEXCore/Source/Interface/Core/JIT/MiscOps.cpp b/FEXCore/Source/Interface/Core/JIT/MiscOps.cpp
+index 6e8df9553..dbade8d3e 100644
+--- a/FEXCore/Source/Interface/Core/JIT/MiscOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/MiscOps.cpp
+@@ -76,6 +76,21 @@ DEF_OP(Break) {
+   LoadConstant(ARMEmitter::Size::i64Bit, TMP1, Constant);
+   str(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, SynchronousFaultData));
+ 
++#ifdef ARCHITECTURE_arm64ec
++  // FEX_FH6_FASTUD=1: raise #UD through the syscall handler, which dispatches the pending
++  // SynchronousFaultData as a guest exception without a host signal.
++  static const bool FastUD = [] {
++    const char* Env = std::getenv("FEX_FH6_FASTUD");
++    return Env && Env[0] == '1';
++  }();
++  if (FastUD && Op->Reason.Signal == Core::FAULT_SIGILL) {
++    SpillStaticRegs(TMP1);
++    ldr(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.ThreadDispatchSyscallHandler));
++    br(TMP1);
++    return;
++  }
++#endif
++
+   switch (Op->Reason.Signal) {
+   case Core::FAULT_SIGILL:
+     ldr(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.GuestSignal_SIGILL));
+diff --git a/FEXCore/Source/Interface/Core/LookupCache.h b/FEXCore/Source/Interface/Core/LookupCache.h
+index 1270da99d..0396294bf 100644
+--- a/FEXCore/Source/Interface/Core/LookupCache.h
++++ b/FEXCore/Source/Interface/Core/LookupCache.h
+@@ -1,6 +1,8 @@
+ // SPDX-License-Identifier: MIT
+ #pragma once
+ #include "Interface/Context/Context.h"
++#include "Utils/crc32.h"
++#include <FEXCore/Utils/FH6Stats.h>
+ #include <FEXCore/Utils/LogManager.h>
+ #include <FEXCore/Utils/SHMStats.h>
+ #include <FEXCore/Utils/WritePriorityMutex.h>
+@@ -12,6 +14,7 @@
+ #include <FEXCore/fextl/vector.h>
+ #include <FEXCore/fextl/memory_resource.h>
+ 
++#include <algorithm>
+ #include <cstdint>
+ #include <cstring>
+ #include <span>
+@@ -20,6 +23,7 @@
+ #include <mutex>
+ 
+ namespace FEXCore {
++
+ struct LookupCacheBaseLockToken {
+ protected:
+   // Protected constructor - only derived classes can construct
+@@ -32,7 +36,14 @@ private:
+   friend struct GuestToHostMap;
+   LookupCacheWriteLockToken(FEXCore::Utils::WritePriorityMutex::Mutex& Mutex)
+     : Lock {Mutex} {}
+-  std::lock_guard<FEXCore::Utils::WritePriorityMutex::Mutex> Lock;
++  LookupCacheWriteLockToken(FEXCore::Utils::WritePriorityMutex::Mutex& Mutex, std::try_to_lock_t Tag)
++    : Lock {Mutex, Tag} {}
++  std::unique_lock<FEXCore::Utils::WritePriorityMutex::Mutex> Lock;
++
++public:
++  bool owns() const {
++    return Lock.owns_lock();
++  }
+ };
+ 
+ struct LookupCacheReadLockToken : public LookupCacheBaseLockToken {
+@@ -52,11 +63,90 @@ struct GuestToHostMap {
+     return LookupCacheWriteLockToken {Lock};
+   }
+ 
++  [[nodiscard]]
++  LookupCacheWriteLockToken TryAcquireWriteLock() {
++    return LookupCacheWriteLockToken {Lock, std::try_to_lock};
++  }
++
+   [[nodiscard]]
+   LookupCacheReadLockToken AcquireReadLock() {
+     return LookupCacheReadLockToken {Lock};
+   }
+ 
++  bool EraseAddress(uint64_t Address) {
++    auto lk = AcquireWriteLock();
++    return Erase(Address, lk);
++  }
++
++  // Title needs BlockList.erase (hbl1/hbkeep stalled). Delink+ClearICache is
++  // the drive-death (hbasync2/hbmtx). Drop the mapping, stash the original
++  // host, leave incoming jumps aimed at it. CompileBlock reuses the stash
++  // when guest CRC matches instead of compiling the rewrite.
++  bool EraseMappingOnly(uint64_t Address) {
++    auto lk = AcquireWriteLock();
++    return EraseMappingOnlyLocked(Address);
++  }
++
++  // One write lock for a whole batch. The SMC worker drains queued RIPs in runs, and every acquisition
++  // of this lock parks the readers of WritePriorityMutex, so batching is what keeps them out of it.
++  void EraseMappingsOnly(const uint64_t* Addresses, size_t Count) {
++    auto lk = AcquireWriteLock();
++    for (size_t i = 0; i < Count; ++i) {
++      EraseMappingOnlyLocked(Addresses[i]);
++    }
++  }
++
++  // Caller holds the write lock.
++  bool EraseMappingOnlyLocked(uint64_t Address) {
++    auto lower = BlockLinks->lower_bound({Address, nullptr});
++    auto upper = BlockLinks->upper_bound({Address, reinterpret_cast<FEXCore::Context::ExitFunctionLinkData*>(UINTPTR_MAX)});
++    for (auto it = lower; it != upper; it = BlockLinks->erase(it)) {
++      it->second(it->first.HostLink);
++    }
++    auto it = BlockList.find(Address);
++    if (it == BlockList.end()) {
++      return false;
++    }
++    Stash.insert_or_assign(Address, it->second);
++    BlockList.erase(it);
++    FEXCore::FH6Stats::Add(FEXCore::FH6Stats::StashStored);
++    return true;
++  }
++
++  // 1 = restored original host, -1 = still rewritten (caller compiles), 0 = no stash.
++  int TryReuseAfterSMC(uint64_t Address, uint64_t* OutHost, const LookupCacheWriteLockToken&) {
++    auto st = Stash.find(Address);
++    if (st == Stash.end()) {
++      return 0;
++    }
++    const uint32_t Len = st->second.GuestCRCLen;
++    if (!Len) {
++      return 0;
++    }
++    FEXCore::FH6Stats::Add(FEXCore::FH6Stats::StashLookups);
++    const uint32_t CRC = FEXCore::Utils::crc32(reinterpret_cast<const uint8_t*>(Address), Len);
++    if (CRC != st->second.GuestCRC) {
++      FEXCore::FH6Stats::Add(FEXCore::FH6Stats::StashMiss);
++      return -1;
++    }
++    auto& Restored = BlockList.insert_or_assign(Address, std::move(st->second)).first->second;
++    Stash.erase(st);
++    *OutHost = Restored.HostCode;
++    return 1;
++  }
++
++  // Occupancy the title needs (write lock + delink icache) without dropping
++  // the original host mapping. hbl1 skipped Erase and 550ms-stalled; full
++  // Erase compiles a replacement in-world (house VID 18).
++  void DelinkKeepMapping(uint64_t Address) {
++    auto lk = AcquireWriteLock();
++    auto lower = BlockLinks->lower_bound({Address, nullptr});
++    auto upper = BlockLinks->upper_bound({Address, reinterpret_cast<FEXCore::Context::ExitFunctionLinkData*>(UINTPTR_MAX)});
++    for (auto it = lower; it != upper; it = BlockLinks->erase(it)) {
++      it->second(it->first.HostLink);
++    }
++  }
++
+   struct BlockLinkTag {
+     uint64_t GuestDestination;
+     FEXCore::Context::ExitFunctionLinkData* HostLink;
+@@ -86,9 +176,12 @@ struct GuestToHostMap {
+   struct BlockEntry {
+     uint64_t HostCode;
+     fextl::vector<uint64_t> CodePages;
++    uint32_t GuestCRC {};
++    uint32_t GuestCRCLen {};
+   };
+ 
+   fextl::robin_map<uint64_t, BlockEntry> BlockList;
++  fextl::robin_map<uint64_t, BlockEntry> Stash;
+ 
+   fextl::map<uint64_t, fextl::vector<uint64_t>> CodePages;
+ 
+@@ -101,8 +194,11 @@ struct GuestToHostMap {
+     //       If the backend updates the active thread's CodeBuffer, the new associated LookupCache
+     //       may already contain the block address. Since is comparatively rare, we'll just leak
+     //       one of the two blocks in this case.
++    const uint64_t Room = 0x1000ULL - (Address & 0xFFFULL);
++    const uint32_t Len = static_cast<uint32_t>(Room < 255 ? Room : 255);
++    const uint32_t CRC = FEXCore::Utils::crc32(reinterpret_cast<const uint8_t*>(Address), Len);
+     return BlockList
+-      .insert_or_assign(Address, BlockEntry {(uintptr_t)HostCode, fextl::vector<uint64_t>(CodePages.begin(), CodePages.end())})
++      .insert_or_assign(Address, BlockEntry {(uintptr_t)HostCode, fextl::vector<uint64_t>(CodePages.begin(), CodePages.end()), CRC, Len})
+       .first->second;
+   }
+ 
+@@ -331,9 +427,16 @@ public:
+ 
+     const auto& Entry = Shared->AddBlockMapping(Address, CodePages, HostCode, lk);
+ 
+-    // There is no need to update L1 or L2, they will get updated on first lookup
+-    // However, adding to L1 here increases performance
+-    CacheBlockMapping(Address, Entry, true, lk);
++    // hbl2add: LoopTop is L2-first (do not flip it L1-first). L1-only here
++    // means the next LoopTop misses L2 and Spill+C++ FindBlock even though
++    // we just compiled. Fill L2 so assembler hits. LoopTop still fills L1
++    // on that hit. Fast, CRC, mutex, TSO, SRA flush unchanged.
++    CacheBlockMapping(Address, Entry, false, lk);
++  }
++
++  int TryReuseAfterSMC(uint64_t Address, uint64_t* OutHost) {
++    auto lk = Shared->AcquireWriteLock();
++    return Shared->TryReuseAfterSMC(Address, OutHost, lk);
+   }
+ 
+   // Invalidates L1/L2 for a given guest block
+@@ -399,6 +502,32 @@ public:
+     InvalidateCache(Address, lk);
+   }
+ 
++  // Owning thread only. Clears this thread's L1/L2 for Address without the
++  // shared write lock. hbasync died_while_loading after writing L1 from a
++  // worker (LookupCache forbids that except during Erase).
++  void InvalidateLocalCache(uint64_t Address) {
++    auto& L1Entry = reinterpret_cast<LookupCacheEntry*>(L1Pointer)[Address & L1PointerMask];
++    if (L1Entry.GuestCode == Address) {
++      L1Entry.GuestCode = 0;
++    }
++    if (!DisableL2Cache()) {
++      uint64_t Addr = Address & (VirtualMemSize - 1);
++      const uint64_t PageOffset = Addr & 0x0FFF;
++      Addr >>= 12;
++      auto* Pointers = reinterpret_cast<uintptr_t*>(PagePointer);
++      const uint64_t LocalPagePointer = Pointers[Addr];
++      if (LocalPagePointer) {
++        auto* BlockPointers = reinterpret_cast<LookupCacheEntry*>(LocalPagePointer);
++        BlockPointers[PageOffset].GuestCode = 0;
++        BlockPointers[PageOffset].HostCode = 0;
++      }
++    }
++  }
++
++  GuestToHostMap* GetSharedMap() const {
++    return Shared;
++  }
++
+   // Protection-change callbacks can precede writes, leaving an entry without reverse page
+   // bookkeeping. Sweep the concrete lookup layers when execution is about to resume after such a
+   // write.
+diff --git a/FEXCore/Source/Interface/Core/SharedCodeBufferManager.cpp b/FEXCore/Source/Interface/Core/SharedCodeBufferManager.cpp
+index eee502364..0b44f51fa 100644
+--- a/FEXCore/Source/Interface/Core/SharedCodeBufferManager.cpp
++++ b/FEXCore/Source/Interface/Core/SharedCodeBufferManager.cpp
+@@ -7,6 +7,8 @@
+ #include <FEXCore/Utils/LogManager.h>
+ #include <FEXCore/Utils/MathUtils.h>
+ 
++#include <cstdlib>
++
+ #ifndef _WIN32
+ #include <FEXCore/Utils/PrctlUtils.h>
+ #endif
+@@ -16,8 +18,51 @@ static constexpr size_t INITIAL_CODE_SIZE = 1024 * 1024 * 16;
+ // We don't want to move above 128MB atm because that means we will have to encode longer jumps
+ static constexpr size_t MAX_CODE_SIZE = 1024 * 1024 * 128;
+ 
+-CodeBuffer::CodeBuffer(size_t Size, bool ShouldBeNamed)
+-  : AllocatedSize(Size) {
++namespace {
++  struct LiveCodeRange {
++    std::atomic<uintptr_t> Begin {};
++    std::atomic<uintptr_t> End {};
++  };
++  constexpr size_t MaxLiveCodeBuffers = 256;
++  LiveCodeRange LiveCodeBuffers[MaxLiveCodeBuffers];
++
++  void RegisterLiveCodeBuffer(uintptr_t Begin, uintptr_t End) {
++    for (auto& Range : LiveCodeBuffers) {
++      uintptr_t Expected = 0;
++      if (Range.Begin.compare_exchange_strong(Expected, Begin, std::memory_order_acq_rel)) {
++        Range.End.store(End, std::memory_order_release);
++        return;
++      }
++    }
++    LogMan::Msg::EFmt("Live code buffer table full");
++  }
++
++  void UnregisterLiveCodeBuffer(uintptr_t Begin) {
++    for (auto& Range : LiveCodeBuffers) {
++      if (Range.Begin.load(std::memory_order_acquire) == Begin) {
++        Range.End.store(0, std::memory_order_release);
++        Range.Begin.store(0, std::memory_order_release);
++        return;
++      }
++    }
++  }
++} // namespace
++
++bool CodeBuffer::AnyLiveContains(uintptr_t Address) {
++  for (const auto& Range : LiveCodeBuffers) {
++    const auto Begin = Range.Begin.load(std::memory_order_acquire);
++    if (Begin && Address >= Begin && Address < Range.End.load(std::memory_order_acquire)) {
++      return true;
++    }
++  }
++  return false;
++}
++
++CodeBuffer::CodeBuffer(size_t Size, bool ShouldBeNamed, fextl::shared_ptr<CodeBuffer> Prev)
++  : LookupCache(Prev ? Prev->LookupCache : fextl::make_shared<GuestToHostMap>())
++  , PrevInChain(std::move(Prev))
++  , ChainBytes(Size + (PrevInChain ? PrevInChain->ChainBytes : 0))
++  , AllocatedSize(Size) {
+   Ptr = static_cast<uint8_t*>(FEXCore::Allocator::VirtualAlloc(Size, true));
+   LOGMAN_THROW_A_FMT(!!Ptr, "Couldn't allocate code buffer");
+ 
+@@ -35,13 +80,13 @@ CodeBuffer::CodeBuffer(size_t Size, bool ShouldBeNamed)
+   // Huge-pages reduce the amount of iTLB misses dramatically when it works.
+   FEXCore::Allocator::VirtualTHPControl(Ptr, Size, FEXCore::Allocator::THPControl::Enable);
+ 
+-  LookupCache = fextl::make_unique<GuestToHostMap>();
+-
+   CodeBufferEnd = Ptr + UsableSize();
+   CodeBufferOffset = Ptr;
++  RegisterLiveCodeBuffer(reinterpret_cast<uintptr_t>(Ptr), reinterpret_cast<uintptr_t>(CodeBufferEnd));
+ }
+ 
+ CodeBuffer::~CodeBuffer() {
++  UnregisterLiveCodeBuffer(reinterpret_cast<uintptr_t>(Ptr));
+   FEXCore::Allocator::VirtualFree(Ptr, AllocatedSize);
+ }
+ 
+@@ -54,9 +99,12 @@ SharedCodeBufferManager::SharedCodeBufferManager() {
+   // `perf top` prefers VMA names over the JIT symbols file for some reason.
+   // Breaks memory tracking when naming is enabled, but it's a debug feature so it isn't expected to be enabled by default.
+   NameJITBuffers = !(GlobalJITNaming || LibraryJITNaming || BlockJITNaming);
++
++  const char* Budget = getenv("FEX_CODE_BUDGET_MB");
++  CodeBudget = size_t {Budget ? strtoull(Budget, nullptr, 10) : 1024} * 1024 * 1024;
+ }
+ 
+-fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::AllocateNew(size_t Size) {
++fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::AllocateNew(size_t Size, fextl::shared_ptr<CodeBuffer> Prev) {
+ #ifndef _WIN32
+   // MDWE (Memory-Deny-Write-Execute) is a new Linux 6.3 feature.
+   // It's equivalent to systemd's `MemoryDenyWriteExecute` but implemented entirely in the kernel.
+@@ -79,7 +127,7 @@ fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::AllocateNew(size_t Size)
+   }
+ #endif
+ 
+-  auto Buffer = fextl::make_shared<CodeBuffer>(Size, NameJITBuffers);
++  auto Buffer = fextl::make_shared<CodeBuffer>(Size, NameJITBuffers, std::move(Prev));
+ 
+   Latest = Buffer;
+ 
+@@ -89,6 +137,7 @@ fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::AllocateNew(size_t Size)
+ }
+ 
+ fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::GetLatest() {
++  std::scoped_lock lk {LatestMutex};
+   if (!Latest) {
+     AllocateNew(INITIAL_CODE_SIZE);
+   }
+@@ -96,17 +145,37 @@ fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::GetLatest() {
+ }
+ 
+ fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::StartLargerCodeBuffer() {
++  std::scoped_lock lk {LatestMutex};
+   if (!Latest) {
+-    // Allocate initial CodeBuffer and return it
+-    return GetLatest();
++    return AllocateNew(INITIAL_CODE_SIZE);
+   }
+ 
+-  auto NewCodeBufferSize = GetLatest()->TotalAllocationSize();
++  auto NewCodeBufferSize = Latest->TotalAllocationSize();
+   NewCodeBufferSize = std::min<size_t>(NewCodeBufferSize * 2, MAX_CODE_SIZE);
+-  return AllocateNew(NewCodeBufferSize);
++  // Continue the chain. Without the link this starts a new one, and the buffer being replaced is freed as
++  // soon as the threads migrate: exit links and lookup entries still point into its code, and the thread
++  // that jumps there faults on an unmapped page.
++  return AllocateNew(NewCodeBufferSize, Latest);
+ }
+ 
+ fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::StartMaximalCodeBuffer() {
++  std::scoped_lock lk {LatestMutex};
+   return AllocateNew(MAX_CODE_SIZE);
+ }
++
++fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::StartOverflowCodeBuffer(const CodeBuffer* Prev) {
++  std::scoped_lock lk {LatestMutex};
++  if (!Latest) {
++    return AllocateNew(INITIAL_CODE_SIZE);
++  }
++  if (Latest.get() != Prev) {
++    return Latest;
++  }
++
++  const auto NewCodeBufferSize = std::min<size_t>(Latest->TotalAllocationSize() * 2, MAX_CODE_SIZE);
++  if (Latest->ChainBytes + NewCodeBufferSize > CodeBudget) {
++    return nullptr;
++  }
++  return AllocateNew(NewCodeBufferSize, Latest);
++}
+ } // namespace FEXCore::CPU
+diff --git a/FEXCore/Source/Interface/Core/SharedCodeBufferManager.h b/FEXCore/Source/Interface/Core/SharedCodeBufferManager.h
+index be7de210b..e050da2b3 100644
+--- a/FEXCore/Source/Interface/Core/SharedCodeBufferManager.h
++++ b/FEXCore/Source/Interface/Core/SharedCodeBufferManager.h
+@@ -8,12 +8,15 @@ $end_info$
+ #pragma once
+ 
+ #include <FEXCore/fextl/memory.h>
++#include <FEXCore/fextl/vector.h>
+ #include <FEXCore/Utils/MathUtils.h>
+ #include <FEXCore/Utils/SignalScopeGuards.h>
+ #include <FEXCore/Utils/TypeDefines.h>
+ 
++#include <atomic>
+ #include <cstddef>
+ #include <cstdint>
++#include <mutex>
+ 
+ namespace FEXCore {
+ struct GuestToHostMap;
+@@ -21,9 +24,17 @@ struct GuestToHostMap;
+ 
+ namespace FEXCore::CPU {
+ struct CodeBuffer {
+-  fextl::unique_ptr<GuestToHostMap> LookupCache;
++  // Shared by every buffer of one overflow chain; see SharedCodeBufferManager::StartOverflowCodeBuffer.
++  fextl::shared_ptr<GuestToHostMap> LookupCache;
+ 
+-  CodeBuffer(size_t Size, bool ShouldBeNamed);
++  // The buffer this one continues. The shared map hands out code from every buffer of the chain,
++  // so holding any of them keeps all older ones alive.
++  const fextl::shared_ptr<CodeBuffer> PrevInChain;
++
++  // Allocation size of this buffer and all older ones in its chain.
++  const size_t ChainBytes;
++
++  CodeBuffer(size_t Size, bool ShouldBeNamed, fextl::shared_ptr<CodeBuffer> Prev = nullptr);
+   CodeBuffer(const CodeBuffer&) = delete;
+   CodeBuffer& operator=(const CodeBuffer&) = delete;
+   CodeBuffer(CodeBuffer&& oth) = delete;
+@@ -91,6 +102,21 @@ struct CodeBuffer {
+     return Ptr;
+   }
+ 
++  // True if Address is in any code buffer still allocated, whichever chain it belongs to. A thread that
++  // moved to a newer chain can still be running linked blocks or call-ret returns in an older one. Signal-safe.
++  static bool AnyLiveContains(uintptr_t Address);
++
++  // True if Address is code in this buffer or an older one of its chain. Signal-safe.
++  bool ChainContains(uintptr_t Address) const {
++    for (const CodeBuffer* Buffer = this; Buffer; Buffer = Buffer->PrevInChain.get()) {
++      const auto Begin = reinterpret_cast<uintptr_t>(Buffer->Ptr);
++      if (Address >= Begin && Address < Begin + Buffer->UsableSize()) {
++        return true;
++      }
++    }
++    return false;
++  }
++
+ private:
+   uint8_t* Ptr;
+   uint8_t* CodeBufferEnd;
+@@ -126,12 +152,20 @@ public:
+   // Subsequent calls to GetLatest will point to the returned buffer.
+   fextl::shared_ptr<CodeBuffer> StartMaximalCodeBuffer();
+ 
++  // The latest buffer is full: allocate fresh code memory that shares its GuestToHostMap, so
++  // every translation stays reachable instead of being recompiled. Returns the current latest
++  // instead if another thread already replaced `Prev`, or null once the chain would exceed the
++  // code budget (FEX_CODE_BUDGET_MB), in which case the caller clears the code cache.
++  fextl::shared_ptr<CodeBuffer> StartOverflowCodeBuffer(const CodeBuffer* Prev);
++
+   virtual void OnCodeBufferAllocated(const std::shared_ptr<CodeBuffer>&) {};
+ 
+ private:
++  std::mutex LatestMutex;
+   fextl::shared_ptr<CodeBuffer> Latest;
++  size_t CodeBudget;
+ 
+-  fextl::shared_ptr<CodeBuffer> AllocateNew(size_t Size);
++  fextl::shared_ptr<CodeBuffer> AllocateNew(size_t Size, fextl::shared_ptr<CodeBuffer> Prev = nullptr);
+ 
+   bool NameJITBuffers {true};
+ };
+diff --git a/FEXCore/Source/Interface/IR/IR.json b/FEXCore/Source/Interface/IR/IR.json
+index 880520077..4ff790c84 100644
+--- a/FEXCore/Source/Interface/IR/IR.json
++++ b/FEXCore/Source/Interface/IR/IR.json
+@@ -201,7 +201,7 @@
+         "DestSize": "OpSize::i64Bit"
+       },
+ 
+-      "ThreadRemoveCodeEntry GPR:$EntryToInvalidate, GPR:$NewRIP": {
++      "ThreadRemoveCodeEntry GPR:$EntryToInvalidate, GPR:$NewRIP, GPR:$PackedCRC": {
+         "HasSideEffects": true
+       },
+ 
+diff --git a/FEXCore/include/FEXCore/Core/CoreState.h b/FEXCore/include/FEXCore/Core/CoreState.h
+index 80514bfdc..20f9e7f14 100644
+--- a/FEXCore/include/FEXCore/Core/CoreState.h
++++ b/FEXCore/include/FEXCore/Core/CoreState.h
+@@ -437,11 +437,17 @@ struct CpuStateFrame {
+ 
+   // Pointers that the JIT needs to load to remove relocations
+   JITPointers Pointers;
++
++  // Occupancy skip: already queued this entry. Fast path LoopTop without
++  // Spill/C++/Fill but still pokes this thread's L1/L2 of the entry (hbfastq
++  // left L2 live and 550ms-stalled title). Cleared when CRC matches.
++  uint64_t LastSMCInvalidateRIP {};
+ };
+ static_assert(offsetof(CpuStateFrame, State) == 0, "CPUState must be first member in CpuStateFrame");
+ static_assert(offsetof(CpuStateFrame, Pointers) % 8 == 0, "JITPointers need to be aligned to 8 bytes");
+ static_assert(offsetof(CpuStateFrame, Pointers) + sizeof(CpuStateFrame::Pointers) <= 32760, "JITPointers maximum pointer needs to be less "
+                                                                                             "than architecture maximum 32768");
++static_assert(offsetof(CpuStateFrame, LastSMCInvalidateRIP) <= 32760, "LastSMCInvalidateRIP must fit in ldr offset");
+ 
+ static_assert(std::is_standard_layout<CpuStateFrame>::value, "This needs to be standard layout");
+ static_assert(sizeof(CpuStateFrame::SynchronousFaultData) == 8, "This needs to be 8 bytes");
+diff --git a/FEXCore/include/FEXCore/Debug/InternalThreadState.h b/FEXCore/include/FEXCore/Debug/InternalThreadState.h
+index 42feabb1c..613ae3a45 100644
+--- a/FEXCore/include/FEXCore/Debug/InternalThreadState.h
++++ b/FEXCore/include/FEXCore/Debug/InternalThreadState.h
+@@ -118,6 +118,11 @@ struct alignas(FEXCore::Utils::FEX_PAGE_SIZE) InternalThreadState : public FEXCo
+   uint64_t JITGuardOverflowArgument {};
+   FEXCore::UncheckedLongJump::JumpBuf RestartJump;
+ 
++  // Pool stub copies (Core.cpp). Kept here because the ARM64EC module has no implicit TLS.
++  bool PoolPatchable {};
++  uint32_t PoolCopySize {};
++  alignas(16) uint8_t PoolCopy[4096];
++
+   // BaseFrameState should always be at the end, directly before the interrupt fault page
+   FEXCore::Core::CpuStateFrame BaseFrameState {};
+ 
+diff --git a/FEXCore/include/FEXCore/Utils/Event.h b/FEXCore/include/FEXCore/Utils/Event.h
+index 3cf0de9ad..fce818855 100644
+--- a/FEXCore/include/FEXCore/Utils/Event.h
++++ b/FEXCore/include/FEXCore/Utils/Event.h
+@@ -12,6 +12,12 @@ private:
+   class Flag final {
+   public:
+     bool TestAndSet(bool SetValue = true) {
++      // Read first so an already-set flag costs a shared load instead of an exclusive CAS. The fence keeps
++      // the caller's earlier stores ahead of this read, as the CAS would, so no wakeup is skipped.
++      std::atomic_thread_fence(std::memory_order_seq_cst);
++      if (Value.load(std::memory_order_relaxed) == SetValue) {
++        return false;
++      }
+       bool Expected = !SetValue;
+       return Value.compare_exchange_strong(Expected, SetValue);
+     }
+diff --git a/FEXCore/include/FEXCore/Utils/FH6Stats.h b/FEXCore/include/FEXCore/Utils/FH6Stats.h
+new file mode 100644
+index 000000000..26f86cf5e
+--- /dev/null
++++ b/FEXCore/include/FEXCore/Utils/FH6Stats.h
+@@ -0,0 +1,228 @@
++// SPDX-License-Identifier: MIT
++#pragma once
++#include <cstdint>
++
++// Process-wide event counters for translation churn. Written by FEX::Windows when
++// FEX_FH6_STATS=1; counting is always on and only happens on slow paths.
++extern "C" uint64_t fh6_stats[55];
++extern "C" uint64_t fh6_pool_keys[65536];
++// First clone/compile mismatch: {guest rip, copy size, compiled size, first differing offset}, then both images.
++extern "C" uint64_t fh6_clone_bad_info[4];
++extern "C" uint8_t fh6_clone_bad[2][1024];
++extern "C" uint64_t fh6_smc[4096][3];
++// Guest exceptions raised from JIT code, keyed by guest rip: {rip, count, exception code, first 8 guest bytes}.
++// Slot 0's count holds the overflow.
++extern "C" uint64_t fh6_exc[256][4];
++// Sampled shape rejects: {rip, blocks, block0 insns, block0 size, compile length, entry points, 32 guest bytes}.
++extern "C" uint64_t fh6_shape[64][10];
++extern "C" uint64_t fh6_shape_tick;
++// Ring of {guest rip, host code} for every block entered into a GuestToHostMap, for attributing
++// host profile samples to guest code. Null (and skipped) unless the stats writer allocated it.
++extern "C" uint64_t (*fh6_blockmap)[2];
++extern "C" uint64_t fh6_blockmap_count;
++
++namespace FEXCore::FH6Stats {
++enum Counter : uint32_t {
++  CompileBlockMiss = 0,  // CompileBlock found nothing in L1/L2/L3
++  JITCompiles = 1,       // backend compiles that produced new code
++  JITGuestBytes = 2,     // guest bytes covered by those compiles
++  StashLookups = 3,      // CompileBlock misses that had SMC-stashed translations for the RIP
++  CodeBufferOverflows = 4, // full code buffer continued in fresh memory on the same map
++  StashMiss = 5,         // ... where no stashed version matched the current bytes
++  CodePageDupes = 6,     // block entries already listed for their code page
++  StashStored = 7,       // translations stashed by an SMC erase
++  SMCMismatch = 8,       // in-block CRC check failed
++  ProtNotify = 9,        // NtProtectVirtualMemory notifications
++  ProtInvalidate = 10,   // notifications that invalidated
++  RWXFaultInvalidate = 11,
++  AlignedInvalidate = 12, // InvalidateAlignedInterval calls
++  IntervalInvalidate = 13, // all-thread invalidations
++  ThreadInvalidateRun = 14,
++  ThreadInvalidateSkipped = 15, // thread had no cached code on those pages
++  ClearCacheNewBuffer = 16,
++  ClearCacheKeepBuffer = 17,
++  IntervalInvalidateTicks = 18,
++  JITCompileTicks = 19,
++  DiskCacheHits = 20,
++  ProtInvalidateBytes = 21,
++  DR7SingleStepCompiles = 22,  // CompileBlock forced MaxInst=1 for an x86 execute breakpoint
++  FreeInvalidate = 23,         // NotifyMemoryFree calls
++  FreeSkippedNonExec = 24, // frees and writes skipped: no executable page in range
++  FlushICacheInvalidate = 25,  // FlushInstructionCache / NotifyMemoryDirty calls
++  SetContextPendingFlush = 26, // SetContext calls that flushed pending RWX intervals
++  BoundaryEvicts = 27,         // GenerateIR mid-block invalid/dispatch boundary evictions
++  RacedCompiles = 28,          // CompileCode found another thread already compiled the block
++  CodeBufferUpdates = 29,      // threads migrated to a newer SharedCodeBuffer
++  BlockInvalidate = 30,        // SMC mismatches that dropped one block instead of its page
++  StaleSMCMismatch = 31,       // SMC mismatch from an old copy; current translation kept
++  JITHostBytes = 32,           // host code bytes produced by JITCompiles
++  PoolCompiles = 33,           // compiles of code outside any image section
++  PoolJmpForm = 34,            // ... whose guest bytes end in jmp rel32
++  PoolKeyRepeat = 35,          // ... whose bytes (jmp target made absolute) were compiled recently
++  PoolCloneHits = 36,          // pool stubs translated by patching a copy of an earlier translation
++  PoolVerifyOK = 37,           // FEX_POOL_CLONE=2: patched copy identical to the fresh compile
++  PoolVerifyBad = 38,          // ... different (first one kept in fh6_clone_bad)
++  PoolTemplatesStored = 39,
++  PoolRejectNotCandidate = 40, // non-image fresh compiles that weren't pool candidates
++  PoolRejectShape = 41,        // not exactly one block of two instructions ending at a 5-byte jmp
++  PoolRejectInsn = 42,         // first instruction branches or is RIP-relative
++  PoolRejectBytes = 43,        // re-read bytes have no jmp, or the target is next to the slot
++  PoolRejectReloc = 44,        // unexpected relocation type or offset
++  PoolRejectRelocValue = 45,   // a guest RIP constant that is neither in the slot nor the jump target
++  PoolRejectCrc = 46,          // no entry CRC, or it doesn't match the re-read bytes
++  PoolRejectNotWritable = 47,
++  LinkCalls = 48,              // ExitFunctionLink entries (unlinked exits taken)
++  LinkCompiled = 49,           // ... that had to call CompileBlock for the target
++  LinkNotPinned = 50,          // ... returned without linking: an end outside the code buffers
++  LinkNotOwned = 51,           // ... returned without linking: target not what the lookup cache holds
++  LinkSharedMismatch = 52,     // ... returned without linking: shared map holds another block
++  LinkMade = 53,               // links written (direct branch or far HostCode pointer)
++  LinkAdopted = 54,            // ... to the shared map's block after dropping a stale L1 copy
++  NumCounters = 55,
++};
++
++// SMC mismatch histogram keyed by guest page: {page, count, last block entry}. Open
++// addressing with a short probe; misses past the probe are counted in slot 0's count.
++static constexpr size_t SMCSlots = 4096;
++
++inline void NoteSMC(uint64_t Rip, uint64_t Resume) {
++  size_t Slot = static_cast<size_t>((Rip * 0x9E3779B97F4A7C15ULL) >> 52) & (SMCSlots - 1);
++  for (size_t Probe = 0; Probe < 16; ++Probe, Slot = (Slot + 1) & (SMCSlots - 1)) {
++    if (Slot == 0) {
++      continue;
++    }
++    uint64_t Key = __atomic_load_n(&fh6_smc[Slot][0], __ATOMIC_RELAXED);
++    if (Key == 0) {
++      uint64_t Expected = 0;
++      if (__atomic_compare_exchange_n(&fh6_smc[Slot][0], &Expected, Rip, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
++        Key = Rip;
++      } else {
++        Key = Expected;
++      }
++    }
++    if (Key == Rip) {
++      __atomic_fetch_add(&fh6_smc[Slot][1], 1, __ATOMIC_RELAXED);
++      __atomic_store_n(&fh6_smc[Slot][2], Resume, __ATOMIC_RELAXED);
++      return;
++    }
++  }
++  __atomic_fetch_add(&fh6_smc[0][1], 1, __ATOMIC_RELAXED);
++}
++
++inline void NoteException(uint64_t Rip, uint32_t Code) {
++  size_t Slot = static_cast<size_t>((Rip * 0x9E3779B97F4A7C15ULL) >> 56);
++  for (size_t Probe = 0; Probe < 16; ++Probe, Slot = (Slot + 1) & 255) {
++    if (Slot == 0) {
++      continue;
++    }
++    uint64_t Key = __atomic_load_n(&fh6_exc[Slot][0], __ATOMIC_RELAXED);
++    if (Key == 0) {
++      uint64_t Expected = 0;
++      if (__atomic_compare_exchange_n(&fh6_exc[Slot][0], &Expected, Rip, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
++        // Only instructions the frontend just decoded are known to be readable.
++        if (Code == 0xC000001D || Code == 0xC0000096 || Code == 0x80000003) {
++          uint64_t Bytes;
++          __builtin_memcpy(&Bytes, reinterpret_cast<const void*>(Rip), sizeof(Bytes));
++          __atomic_store_n(&fh6_exc[Slot][3], Bytes, __ATOMIC_RELAXED);
++        }
++        Key = Rip;
++      } else {
++        Key = Expected;
++      }
++    }
++    if (Key == Rip) {
++      __atomic_store_n(&fh6_exc[Slot][2], Code, __ATOMIC_RELAXED);
++      __atomic_fetch_add(&fh6_exc[Slot][1], 1, __ATOMIC_RELAXED);
++      return;
++    }
++  }
++  __atomic_fetch_add(&fh6_exc[0][1], 1, __ATOMIC_RELAXED);
++}
++
++static constexpr size_t BlockMapSlots = size_t {1} << 21;
++
++// True only under FEX_FH6_STATS=1 (the writer allocates fh6_blockmap). Gates notes on paths that
++// are hot in-world, where the shared counter lines bounce between the SMC-churn threads.
++inline bool Enabled() {
++  return __atomic_load_n(&fh6_blockmap, __ATOMIC_RELAXED) != nullptr;
++}
++
++inline void NoteBlock(uint64_t Rip, uint64_t HostCode) {
++  auto* Map = __atomic_load_n(&fh6_blockmap, __ATOMIC_ACQUIRE);
++  if (!Map) {
++    return;
++  }
++  const uint64_t Slot = __atomic_fetch_add(&fh6_blockmap_count, 1, __ATOMIC_RELAXED) & (BlockMapSlots - 1);
++  __atomic_store_n(&Map[Slot][1], HostCode, __ATOMIC_RELAXED);
++  __atomic_store_n(&Map[Slot][0], Rip, __ATOMIC_RELEASE);
++}
++
++inline void Add(Counter C, uint64_t V = 1) {
++  __atomic_fetch_add(&fh6_stats[C], V, __ATOMIC_RELAXED);
++}
++
++inline void NoteCloneMismatch(uint64_t Rip, const uint8_t* Copy, uint64_t CopySize, const uint8_t* Compiled, uint64_t CompiledSize) {
++  uint64_t Expected = 0;
++  if (!__atomic_compare_exchange_n(&fh6_clone_bad_info[0], &Expected, ~0ULL, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
++    return;
++  }
++  uint64_t Diff = 0;
++  while (Diff < CopySize && Diff < CompiledSize && Copy[Diff] == Compiled[Diff]) {
++    ++Diff;
++  }
++  __builtin_memcpy(fh6_clone_bad[0], Copy, CopySize < 1024 ? CopySize : 1024);
++  __builtin_memcpy(fh6_clone_bad[1], Compiled, CompiledSize < 1024 ? CompiledSize : 1024);
++  fh6_clone_bad_info[1] = CopySize;
++  fh6_clone_bad_info[2] = CompiledSize;
++  fh6_clone_bad_info[3] = Diff;
++  __atomic_store_n(&fh6_clone_bad_info[0], Rip, __ATOMIC_RELEASE);
++}
++
++// One reject in 512 overwrites a slot of fh6_shape; rows may tear, which only matters for display.
++inline void NoteShape(uint64_t Rip, uint64_t Blocks, uint64_t Insns, uint64_t BlockSize, uint64_t Length, uint64_t EntryPoints) {
++  const uint64_t Tick = __atomic_fetch_add(&fh6_shape_tick, 1, __ATOMIC_RELAXED);
++  if (Tick & 511) {
++    return;
++  }
++  auto& Row = fh6_shape[(Tick >> 9) & 63];
++  Row[1] = Blocks;
++  Row[2] = Insns;
++  Row[3] = BlockSize;
++  Row[4] = Length;
++  Row[5] = EntryPoints;
++  __builtin_memset(&Row[6], 0, 32);
++  __builtin_memcpy(&Row[6], reinterpret_cast<const void*>(Rip), Length < 32 ? Length : 32);
++  __atomic_store_n(&Row[0], Rip, __ATOMIC_RELEASE);
++}
++
++// Direct-mapped set of recent content keys, so a repeat means "same bytes compiled not long ago".
++inline void NotePoolCompile(const uint8_t* Code, uint64_t Length) {
++  Add(PoolCompiles);
++  uint64_t Body = Length;
++  uint64_t Key = 0x9E3779B97F4A7C15ULL;
++  if (Length >= 5 && Code[Length - 5] == 0xE9) {
++    int32_t Rel;
++    __builtin_memcpy(&Rel, Code + Length - 4, sizeof(Rel));
++    Key ^= reinterpret_cast<uint64_t>(Code) + Length + static_cast<int64_t>(Rel);
++    Body = Length - 5;
++    Add(PoolJmpForm);
++  } else {
++    Key ^= reinterpret_cast<uint64_t>(Code);
++  }
++  for (uint64_t i = 0; i < Body; ++i) {
++    Key = (Key ^ Code[i]) * 0x100000001B3ULL;
++  }
++  Key = (Key ^ (Key >> 29)) * 0xBF58476D1CE4E5B9ULL;
++  Key |= 1;
++  auto& Slot = fh6_pool_keys[(Key >> 40) & 65535];
++  if (__atomic_exchange_n(&Slot, Key, __ATOMIC_RELAXED) == Key) {
++    Add(PoolKeyRepeat);
++  }
++}
++
++inline uint64_t Ticks() {
++  uint64_t T;
++  __asm volatile("mrs %0, cntvct_el0" : "=r"(T));
++  return T;
++}
++} // namespace FEXCore::FH6Stats
+diff --git a/Source/Windows/ARM64EC/Module.S b/Source/Windows/ARM64EC/Module.S
+index 2489e653c..f048c0263 100644
+--- a/Source/Windows/ARM64EC/Module.S
++++ b/Source/Windows/ARM64EC/Module.S
+@@ -56,9 +56,13 @@ BeginSimulation:
+ .global ExitFunctionEC
+ ExitFunctionEC:
+   // Clear any the AFP NEP and AH bits in FPCR as native code won't expect their behaviour.
++  // Skip the serializing write when they are already clear. x16 is free here and avoids clobbering NZCV.
+   mrs x17, fpcr
++  and x16, x17, #6
++  cbz x16, 9f
+   and x17, x17, #~6 // NEP + AH
+   msr fpcr, x17
++9:
+   ldr x17, [x18, #0x1788] // TEB->ChpeV2CpuAreaInfo
+   strb wzr, [x17, #0x0] // ChpeV2CpuAreaInfo->InSimulation
+   ldr x17, [x17, #0x20] // ChpeV2CpuAreaInfo->SuspendDoorbell
+diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+index f48597081..e5d147069 100644
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -23,6 +23,7 @@ $end_info$
+ #include <FEXCore/Utils/EnumOperators.h>
+ #include <FEXCore/Utils/EnumUtils.h>
+ #include <FEXCore/Utils/FPState.h>
++#include <FEXCore/Utils/FH6Stats.h>
+ #include <FEXCore/Utils/ArchHelpers/Arm64.h>
+ #include <FEXCore/Utils/MathUtils.h>
+ #include <FEXCore/Utils/TypeDefines.h>
+@@ -57,12 +58,266 @@ $end_info$
+ #include <optional>
+ #include <unordered_map>
+ #include <utility>
++#include <algorithm>
++#include <array>
++#include <cstring>
++#include <vector>
+ #include <ntstatus.h>
+ #include <windef.h>
+ #include <winternl.h>
+ #include <winnt.h>
+ #include <wine/debug.h>
+ 
++// FEX_FH6_STATS=1: every 10 s, rewrites Download/fh6_stats-<pid>.txt with one line per period of
++// the cumulative FEXCore::FH6Stats counters ("t <seconds> c0 c1 ..."), after a "cntfrq" line.
++// Also rewrites Download/fh6_smc-<pid>.txt with the 64 guest pages whose blocks failed their
++// in-block code check most often ("page count lastblock", cumulative).
++namespace FH6StatsWriter {
++struct PidPath {
++  wchar_t Path[112];
++  UNICODE_STRING Name;
++
++  explicit PidPath(const wchar_t* Prefix, const wchar_t* Suffix = L".txt") {
++    size_t N = 0;
++    for (; Prefix[N]; ++N) {
++      Path[N] = Prefix[N];
++    }
++    wchar_t Digits[12];
++    size_t D = 0;
++    for (uint32_t Pid = GetCurrentProcessId(); Pid || !D; Pid /= 10) {
++      Digits[D++] = L'0' + Pid % 10;
++    }
++    while (D) {
++      Path[N++] = Digits[--D];
++    }
++    for (const wchar_t* S = Suffix; *S; ++S) {
++      Path[N++] = *S;
++    }
++    Path[N] = 0;
++    Name = {.Length = static_cast<USHORT>(N * sizeof(wchar_t)), .MaximumLength = static_cast<USHORT>((N + 1) * sizeof(wchar_t)), .Buffer = Path};
++  }
++
++  void Write(const fextl::string& Out) {
++    Write(Out.data(), Out.size());
++  }
++
++  void Write(const void* Data, size_t Size, bool Append = false) {
++    OBJECT_ATTRIBUTES Attributes;
++    InitializeObjectAttributes(&Attributes, &Name, OBJ_CASE_INSENSITIVE, nullptr, nullptr);
++    HANDLE File;
++    IO_STATUS_BLOCK IOSB;
++    if (NtCreateFile(&File, (Append ? FILE_APPEND_DATA : GENERIC_WRITE) | SYNCHRONIZE, &Attributes, &IOSB, nullptr, FILE_ATTRIBUTE_NORMAL,
++                     0, Append ? FILE_OPEN_IF : FILE_OVERWRITE_IF, FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE, nullptr, 0)) {
++      return;
++    }
++    DWORD Written;
++    WriteFile(File, Data, static_cast<DWORD>(Size), &Written, nullptr);
++    NtClose(File);
++  }
++};
++
++static fextl::string FormatSMC() {
++  fextl::vector<std::array<uint64_t, 3>> Rows;
++  for (size_t i = 1; i < FEXCore::FH6Stats::SMCSlots; ++i) {
++    const uint64_t Rip = __atomic_load_n(&fh6_smc[i][0], __ATOMIC_RELAXED);
++    if (Rip) {
++      Rows.push_back({Rip, __atomic_load_n(&fh6_smc[i][1], __ATOMIC_RELAXED), __atomic_load_n(&fh6_smc[i][2], __ATOMIC_RELAXED)});
++    }
++  }
++  std::sort(Rows.begin(), Rows.end(), [](const auto& A, const auto& B) { return A[1] > B[1]; });
++  fextl::string Out = fextl::fmt::format("entries {} overflow {}\n", Rows.size(), __atomic_load_n(&fh6_smc[0][1], __ATOMIC_RELAXED));
++  for (size_t i = 0; i < Rows.size() && i < 64; ++i) {
++    Out += fextl::fmt::format("{:x} {} {:x}\n", Rows[i][0], Rows[i][1], Rows[i][2]);
++  }
++  const uint64_t BadRip = __atomic_load_n(&fh6_clone_bad_info[0], __ATOMIC_ACQUIRE);
++  if (BadRip && BadRip != ~0ULL) {
++    Out += fextl::fmt::format("clonebad rip {:x} copy {} compiled {} diff {:x}\n", BadRip, fh6_clone_bad_info[1], fh6_clone_bad_info[2],
++                              fh6_clone_bad_info[3]);
++    for (size_t Image = 0; Image < 2; ++Image) {
++      const size_t Size = std::min<uint64_t>(fh6_clone_bad_info[Image + 1], 1024);
++      Out += Image ? "compiled" : "copy";
++      for (size_t i = 0; i < Size; i += 4) {
++        uint32_t Word;
++        memcpy(&Word, &fh6_clone_bad[Image][i], sizeof(Word));
++        Out += fextl::fmt::format(" {:08x}", Word);
++      }
++      Out += "\n";
++    }
++  }
++  Out += fextl::fmt::format("exc overflow {}\n", __atomic_load_n(&fh6_exc[0][1], __ATOMIC_RELAXED));
++  for (size_t i = 1; i < 256; ++i) {
++    const uint64_t Rip = __atomic_load_n(&fh6_exc[i][0], __ATOMIC_RELAXED);
++    if (Rip) {
++      Out += fextl::fmt::format("exc rip {:x} count {} code {:x} bytes {:016x}\n", Rip, __atomic_load_n(&fh6_exc[i][1], __ATOMIC_RELAXED),
++                                __atomic_load_n(&fh6_exc[i][2], __ATOMIC_RELAXED), __builtin_bswap64(fh6_exc[i][3]));
++    }
++  }
++  for (const auto& Row : fh6_shape) {
++    const uint64_t Rip = __atomic_load_n(&Row[0], __ATOMIC_ACQUIRE);
++    if (!Rip) {
++      continue;
++    }
++    Out += fextl::fmt::format("shape rip {:x} blocks {} insns {} bsize {} len {} entries {} bytes", Rip, Row[1], Row[2], Row[3], Row[4], Row[5]);
++    const auto* Bytes = reinterpret_cast<const uint8_t*>(&Row[6]);
++    for (size_t i = 0; i < std::min<uint64_t>(Row[4], 32); ++i) {
++      Out += fextl::fmt::format(" {:02x}", Bytes[i]);
++    }
++    Out += "\n";
++  }
++  return Out;
++}
++
++extern "C" NTSTATUS WINAPI NtGetNextThread(HANDLE, HANDLE, ACCESS_MASK, ULONG, ULONG, HANDLE*);
++extern "C" NTSTATUS WINAPI NtResumeThread(HANDLE, PULONG);
++extern "C" NTSTATUS WINAPI NtReadVirtualMemory(HANDLE, const void*, void*, SIZE_T, SIZE_T*);
++
++// FEX_FH6_SPINSAMPLE=1: threads that used more than 80% of a period's wall time get suspended a few
++// times and their guest rip, rsp and code bytes appended to Download/fh6_spin-<pid>.txt.
++struct SpinSampler {
++  static constexpr size_t MaxThreads = 512;
++  struct Entry {
++    uint64_t Tid;
++    uint64_t UserTime;
++  };
++  Entry Prev[MaxThreads] {};
++  size_t PrevCount {};
++
++  uint64_t LastTime(uint64_t Tid) const {
++    for (size_t i = 0; i < PrevCount; ++i) {
++      if (Prev[i].Tid == Tid) {
++        return Prev[i].UserTime;
++      }
++    }
++    return ~0ULL;
++  }
++
++  fextl::string Sample(uint64_t Seconds, uint64_t PeriodTicks100ns) {
++    fextl::string Out;
++    Entry Cur[MaxThreads];
++    size_t CurCount = 0;
++    HANDLE Thread = nullptr;
++    HANDLE Next;
++    while (!NtGetNextThread(NtCurrentProcess(), Thread, THREAD_QUERY_INFORMATION | THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, 0, 0, &Next)) {
++      if (Thread) {
++        NtClose(Thread);
++      }
++      Thread = Next;
++      THREAD_BASIC_INFORMATION Info;
++      KERNEL_USER_TIMES Times;
++      if (NtQueryInformationThread(Thread, ThreadBasicInformation, &Info, sizeof(Info), nullptr) ||
++          NtQueryInformationThread(Thread, ThreadTimes, &Times, sizeof(Times), nullptr)) {
++        continue;
++      }
++      const uint64_t Tid = reinterpret_cast<uint64_t>(Info.ClientId.UniqueThread);
++      const uint64_t User = Times.UserTime.QuadPart;
++      if (CurCount < MaxThreads) {
++        Cur[CurCount++] = {Tid, User};
++      }
++      const uint64_t Before = LastTime(Tid);
++      if (Tid == GetCurrentThreadId() || Before == ~0ULL || User - Before < PeriodTicks100ns * 8 / 10) {
++        continue;
++      }
++      constexpr size_t Samples = 8;
++      uint64_t Rip[Samples] {}, Rsp[Samples] {};
++      for (size_t s = 0; s < Samples; ++s) {
++        if (NtSuspendThread(Thread, nullptr)) {
++          break;
++        }
++        CONTEXT Ctx {};
++        Ctx.ContextFlags = CONTEXT_CONTROL;
++        if (!NtGetContextThread(Thread, &Ctx)) {
++          Rip[s] = Ctx.Rip;
++          Rsp[s] = Ctx.Rsp;
++        }
++        NtResumeThread(Thread, nullptr);
++        LARGE_INTEGER Gap {.QuadPart = -50000LL};
++        NtDelayExecution(false, &Gap);
++      }
++      Out += fextl::fmt::format("t {} tid {} user_ms {}", Seconds, Tid, (User - Before) / 10000);
++      for (size_t s = 0; s < Samples; ++s) {
++        Out += fextl::fmt::format(" {:x}/{:x}", Rip[s], Rsp[s]);
++      }
++      uint8_t Bytes[48] {};
++      SIZE_T Read = 0;
++      NtReadVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(Rip[0] & ~0xFULL), Bytes, sizeof(Bytes), &Read);
++      Out += fextl::fmt::format(" code@{:x}", Rip[0] & ~0xFULL);
++      for (size_t i = 0; i < Read; ++i) {
++        Out += fextl::fmt::format(" {:02x}", Bytes[i]);
++      }
++      Out += "\n";
++    }
++    if (Thread) {
++      NtClose(Thread);
++    }
++    __builtin_memcpy(Prev, Cur, CurCount * sizeof(Entry));
++    PrevCount = CurCount;
++    return Out;
++  }
++};
++
++static void* Run(void*) {
++  PidPath Stats(L"\\??\\Z:\\storage\\emulated\\0\\Download\\fh6_stats-");
++  PidPath Spin(L"\\??\\Z:\\storage\\emulated\\0\\Download\\fh6_spin-");
++  const char* SpinEnv = std::getenv("FEX_FH6_SPINSAMPLE");
++  static SpinSampler Sampler;
++  const bool SampleSpins = SpinEnv && SpinEnv[0] == '1';
++  PidPath SMC(L"\\??\\Z:\\storage\\emulated\\0\\Download\\fh6_smc-");
++  PidPath Blocks(L"\\??\\Z:\\storage\\emulated\\0\\Download\\fh6_blocks-", L".bin");
++  uint64_t BlocksWritten = 0;
++
++  uint64_t Freq;
++  __asm volatile("mrs %0, cntfrq_el0" : "=r"(Freq));
++  fextl::string Out = fextl::fmt::format("cntfrq {}\n", Freq);
++  LARGE_INTEGER Period {.QuadPart = -100000000LL};
++  for (uint64_t Seconds = 10;; Seconds += 10) {
++    NtDelayExecution(false, &Period);
++    Out += fextl::fmt::format("t {}", Seconds);
++    for (size_t i = 0; i < FEXCore::FH6Stats::NumCounters; ++i) {
++      Out += fextl::fmt::format(" {}", __atomic_load_n(&fh6_stats[i], __ATOMIC_RELAXED));
++    }
++    Out += "\n";
++    Stats.Write(Out);
++    SMC.Write(FormatSMC());
++    if (SampleSpins) {
++      const auto Spins = Sampler.Sample(Seconds, 100000000ULL);
++      if (!Spins.empty()) {
++        Spin.Write(Spins.data(), Spins.size(), true);
++      }
++    }
++    constexpr uint64_t Slots = FEXCore::FH6Stats::BlockMapSlots;
++    const uint64_t Count = __atomic_load_n(&fh6_blockmap_count, __ATOMIC_ACQUIRE);
++    if (fh6_blockmap && Count != BlocksWritten) {
++      // Entries older than one lap of the ring were overwritten before we got to them.
++      uint64_t From = Count - BlocksWritten > Slots ? Count - Slots : BlocksWritten;
++      bool Append = BlocksWritten != 0;
++      while (From != Count) {
++        const uint64_t Slot = From & (Slots - 1);
++        const uint64_t N = std::min(Count - From, Slots - Slot);
++        Blocks.Write(&fh6_blockmap[Slot], N * sizeof(fh6_blockmap[0]), Append);
++        Append = true;
++        From += N;
++      }
++      BlocksWritten = Count;
++    }
++  }
++  return nullptr;
++}
++
++static void Start() {
++  const char* Env = std::getenv("FEX_FH6_STATS");
++  if (!Env || Env[0] != '1') {
++    return;
++  }
++  void* Map = nullptr;
++  SIZE_T MapSize = FEXCore::FH6Stats::BlockMapSlots * sizeof(fh6_blockmap[0]);
++  if (!NtAllocateVirtualMemory(NtCurrentProcess(), &Map, 0, &MapSize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)) {
++    __atomic_store_n(&fh6_blockmap, static_cast<uint64_t(*)[2]>(Map), __ATOMIC_RELEASE);
++  }
++  static fextl::unique_ptr<FEXCore::Threads::Thread> Thread;
++  Thread = FEXCore::Threads::Thread::Create(Run, nullptr, {.Internal = true}, "FH6Stats");
++}
++} // namespace FH6StatsWriter
++
+ namespace Exception {
+ class ECSyscallHandler;
+ }
+@@ -542,17 +797,9 @@ static ARM64_NT_CONTEXT StoreStateToPackedECContext(FEXCore::Core::InternalThrea
+   return ECContext;
+ }
+ 
+-static void RethrowGuestException(const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT& Context) {
+-  auto* Thread = GetCPUArea().ThreadState();
++static void RaiseGuestException(FEXCore::Core::InternalThreadState* Thread, const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT& GuestContext) {
+   auto& Fault = Thread->CurrentFrame->SynchronousFaultData;
+ 
+-  LogMan::Msg::DFmt("Reconstructing context");
+-  if (!IsDispatcherAddress(Context.Pc)) {
+-    ReconstructThreadState(Thread, Context);
+-  }
+-  ARM64_NT_CONTEXT GuestContext = StoreStateToPackedECContext(Thread, Context.Fpcr, Context.Fpsr);
+-  LogMan::Msg::DFmt("pc: {:X} rip: {:X}", Context.Pc, GuestContext.Pc);
+-
+   // X64 Windows always clears TF, DF and AF when handling an exception, restoring after.
+   // Current ARM64EC windows can only restore NZCV+SS when returning from an exception and other flags are left untouched from the handler context.
+   // TODO: Can extend wine to support this by mapping the remaining EFlags into reserved cpsr members.
+@@ -562,6 +809,7 @@ static void RethrowGuestException(const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT&
+ 
+   BOOL FirstChance = TRUE;
+   EXCEPTION_RECORD GuestRec = FEX::Windows::HandleGuestException(Fault, Rec, GuestContext.Pc, GuestContext.X8, GuestContext.X0, FirstChance);
++  FEXCore::FH6Stats::NoteException(GuestContext.Pc, GuestRec.ExceptionCode);
+   if (GuestRec.ExceptionCode == EXCEPTION_SINGLE_STEP) {
+     GuestContext.Cpsr &= ~(1 << 21); // PSTATE.SS
+   } else if (GuestRec.ExceptionCode == EXCEPTION_BREAKPOINT) {
+@@ -572,6 +820,85 @@ static void RethrowGuestException(const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT&
+   NtRaiseExceptionNative(&GuestRec, &GuestContext, FirstChance);
+ }
+ 
++// Appends Download/fh6_badraise-<pid>.txt when a JIT/dispatcher fault would be raised to the guest with a
++// null RSP: the host registers, which code region the PC is in, and the instructions around it.
++static void NoteBadRaise(FEXCore::Core::InternalThreadState* Thread, const EXCEPTION_RECORD& Rec, const ARM64_NT_CONTEXT& Context,
++                         const ARM64_NT_CONTEXT& GuestContext, uint64_t RipBefore) {
++  static std::atomic<uint32_t> Lines {};
++  if (Lines.fetch_add(1, std::memory_order_relaxed) >= 20) {
++    return;
++  }
++  const auto& Config = SignalDelegator->GetConfig();
++  const auto CPUArea = GetCPUArea();
++  const uint64_t Pc = Context.Pc;
++  fextl::string Out = fextl::fmt::format(
++    "badraise tid {} code {:x} p0 {:x} p1 {:x} pc {:x} sp {:x} lr {:x} fp {:x} x17 {:x} x23 {:x} x24 {:x} x28 {:x} frame {:x} "
++    "disp {:d} [{:x},{:x}) jit {:d} rip_before {:x} rip_host {:x} guest pc {:x} sp {:x} emustack [{:x},{:x}] sra_rsp x{}\n",
++    GetCurrentThreadId(), static_cast<uint32_t>(Rec.ExceptionCode), Rec.ExceptionInformation[0], Rec.ExceptionInformation[1], Pc,
++    Context.Sp, Context.Lr, Context.Fp, Context.X17, Context.X23, Context.X24, Context.X28,
++    reinterpret_cast<uint64_t>(CPUArea.StateFrame()), IsDispatcherAddress(Pc), Config.DispatcherBegin, Config.DispatcherEnd,
++    CTX->IsAddressInCodeBuffer(Thread, Pc), RipBefore, CTX->RestoreRIPFromHostPC(Thread, Pc), GuestContext.Pc, GuestContext.Sp,
++    CPUArea.EmulatorStackLimit(), CPUArea.EmulatorStackBase(), static_cast<uint32_t>(Config.SRAGPRMapping[FEXCore::X86State::REG_RSP]));
++  if (CTX->IsAddressInCodeBuffer(Thread, Pc) || IsDispatcherAddress(Pc)) {
++    Out += fextl::fmt::format("  code@{:x}", Pc - 40);
++    for (uint64_t A = Pc - 40; A < Pc + 24; A += 4) {
++      Out += fextl::fmt::format(" {:08x}", *reinterpret_cast<const uint32_t*>(A));
++    }
++    Out += "\n";
++  }
++  FH6StatsWriter::PidPath Path(L"\\??\\Z:\\storage\\emulated\\0\\Download\\fh6_badraise-");
++  Path.Write(Out.data(), Out.size(), true);
++}
++
++// Appends to the same file when a JIT fault is handed to the guest handlers as-is: they see a host JIT
++// context in x64 layout, and continuing it resumes the JIT with x23/x24/x28 zeroed.
++static void NoteJitPassThrough(FEXCore::Core::InternalThreadState* Thread, const EXCEPTION_RECORD& Rec, const ARM64_NT_CONTEXT& Context,
++                               uint64_t HandlerFrame, const char* Tag) {
++  static std::atomic<uint32_t> Lines {};
++  if (Lines.fetch_add(1, std::memory_order_relaxed) >= 20) {
++    return;
++  }
++  const auto CPUArea = GetCPUArea();
++  fextl::string Out = fextl::fmt::format(
++    "{} tid {} code {:x} p0 {:x} p1 {:x} pc {:x} sp {:x} lr {:x} x17 {:x} x23 {:x} x28 {:x} handler_frame {:x} "
++    "emustack [{:x},{:x}] rip {:x} rip_host {:x} insim {:d} incb {:d}\n",
++    Tag, GetCurrentThreadId(), static_cast<uint32_t>(Rec.ExceptionCode), Rec.ExceptionInformation[0], Rec.ExceptionInformation[1], Context.Pc,
++    Context.Sp, Context.Lr, Context.X17, Context.X23, Context.X28, HandlerFrame, CPUArea.EmulatorStackLimit(),
++    CPUArea.EmulatorStackBase(), Thread->CurrentFrame->State.rip,
++    CTX->IsAddressInCodeBuffer(Thread, Context.Pc) ? CTX->RestoreRIPFromHostPC(Thread, Context.Pc) : 0,
++    CPUArea.Area->InSimulation, CPUArea.Area->InSyscallCallback);
++  FH6StatsWriter::PidPath Path(L"\\??\\Z:\\storage\\emulated\\0\\Download\\fh6_badraise-");
++  Path.Write(Out.data(), Out.size(), true);
++}
++
++static void RethrowGuestException(const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT& Context) {
++  auto* Thread = GetCPUArea().ThreadState();
++  const uint64_t RipBefore = Thread->CurrentFrame->State.rip;
++
++  LogMan::Msg::DFmt("Reconstructing context");
++  if (!IsDispatcherAddress(Context.Pc)) {
++    ReconstructThreadState(Thread, Context);
++  }
++  ARM64_NT_CONTEXT GuestContext = StoreStateToPackedECContext(Thread, Context.Fpcr, Context.Fpsr);
++  if (GuestContext.Sp < 0x10000) {
++    NoteBadRaise(Thread, Rec, Context, GuestContext, RipBefore);
++  }
++  LogMan::Msg::DFmt("pc: {:X} rip: {:X}", Context.Pc, GuestContext.Pc);
++  RaiseGuestException(Thread, Rec, GuestContext);
++}
++
++// A Break the JIT routed through the syscall handler (FEX_FH6_FASTUD): the guest state is already
++// spilled at the faulting instruction, so raise the pending fault directly. Dispatch runs with
++// syscall callbacks disabled, as it does when the fault arrives through ResetToConsistentState.
++static void RaiseSynchronousGuestFault(uint64_t FPCR, uint64_t FPSR) {
++  const auto CPUArea = GetCPUArea();
++  CPUArea.Area->InSyscallCallback = true;
++  auto* Thread = CPUArea.ThreadState();
++  ARM64_NT_CONTEXT GuestContext = StoreStateToPackedECContext(Thread, static_cast<uint32_t>(FPCR), static_cast<uint32_t>(FPSR));
++  EXCEPTION_RECORD Rec {.ExceptionCode = static_cast<DWORD>(EXCEPTION_ILLEGAL_INSTRUCTION)};
++  RaiseGuestException(Thread, Rec, GuestContext);
++}
++
+ class ECSyscallHandler : public FEXCore::HLE::SyscallHandler, public FEXCore::Allocator::FEXAllocOperators {
+ public:
+   ECSyscallHandler() = default;
+@@ -585,6 +912,10 @@ public:
+     __asm volatile("mrs %[fpcr], fpcr" : [fpcr] "=r"(FPCR));
+     __asm volatile("mrs %[fpsr], fpsr" : [fpsr] "=r"(FPSR));
+ 
++    if (Frame->SynchronousFaultData.FaultToTopAndGeneratedException) {
++      RaiseSynchronousGuestFault(FPCR, FPSR);
++    }
++
+     auto* Thread = GetCPUArea().ThreadState();
+     KiUserExceptionDispatcherStackLayout DispatchArgs {
+       .Context = StoreStateToPackedECContext(Thread, static_cast<uint32_t>(FPCR), static_cast<uint32_t>(FPSR)),
+@@ -722,10 +1053,41 @@ NTSTATUS ProcessInit() {
+     std::this_thread::sleep_for(std::chrono::seconds(StartupSleep()));
+   }
+ 
++  FH6StatsWriter::Start();
++
+   return STATUS_SUCCESS;
+ }
+ 
+-void ProcessTerm(HANDLE Handle, BOOL After, NTSTATUS Status) {}
++// Appends Download/fh6_exit-<pid>.txt on NtTerminateProcess: status, caller tid, and every stack qword
++// that points into executable image pages (guest x64 and native frames share this stack on ARM64EC).
++// No file after a death means the process was killed from outside (SIGKILL), not exited.
++void ProcessTerm(HANDLE Handle, BOOL After, NTSTATUS Status) {
++  if (After) {
++    return;
++  }
++  FH6StatsWriter::PidPath Path(L"\\??\\Z:\\storage\\emulated\\0\\Download\\fh6_exit-");
++  const uint64_t Sp = reinterpret_cast<uint64_t>(__builtin_frame_address(0));
++  const uint64_t StackBase = reinterpret_cast<uint64_t>(reinterpret_cast<NT_TIB*>(NtCurrentTeb())->StackBase);
++  fextl::string Out = fextl::fmt::format("term handle {:x} status {:x} tid {} sp {:x} stackbase {:x}\n", reinterpret_cast<uint64_t>(Handle),
++                                         static_cast<uint32_t>(Status), GetCurrentThreadId(), Sp, StackBase);
++  constexpr DWORD ExecMask = PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
++  size_t Hits = 0;
++  for (uint64_t A = Sp; A + 8 <= StackBase && A < Sp + 0x40000 && Hits < 48; A += 8) {
++    const uint64_t V = *reinterpret_cast<const uint64_t*>(A);
++    if (V < 0x10000) {
++      continue;
++    }
++    MEMORY_BASIC_INFORMATION Info;
++    if (NtQueryVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(V), MemoryBasicInformation, &Info, sizeof(Info), nullptr) ||
++        Info.Type != MEM_IMAGE || !(Info.Protect & ExecMask)) {
++      continue;
++    }
++    const uint64_t Base = reinterpret_cast<uint64_t>(Info.AllocationBase);
++    Out += fextl::fmt::format("  sp+{:x} {:x} mod {:x}+{:x}\n", A - Sp, V, Base, V - Base);
++    ++Hits;
++  }
++  Path.Write(Out.data(), Out.size(), true);
++}
+ 
+ class ScopedCallbackDisable {
+ private:
+@@ -799,6 +1161,9 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
+ 
+   if (!IsJIT && !IsDispatcherAddress(NativeContext->Pc)) {
+     LogMan::Msg::DFmt("Passing through exception");
++    if (NativeContext->X28 == reinterpret_cast<uint64_t>(Thread->CurrentFrame)) {
++      Exception::NoteJitPassThrough(Thread, *Exception, *NativeContext, reinterpret_cast<uint64_t>(__builtin_frame_address(0)), "notjit");
++    }
+     return false;
+   }
+ 
+@@ -819,6 +1184,7 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
+     return true;
+   } else {
+     LogMan::Msg::EFmt("Unexpected exception in JIT code on guest stack");
++    Exception::NoteJitPassThrough(Thread, *Exception, *NativeContext, reinterpret_cast<uint64_t>(__builtin_frame_address(0)), "passjit");
+     return false;
+   }
+ }
+diff --git a/Source/Windows/Common/CPUFeatures.cpp b/Source/Windows/Common/CPUFeatures.cpp
+index c033db8af..d981a5b52 100644
+--- a/Source/Windows/Common/CPUFeatures.cpp
++++ b/Source/Windows/Common/CPUFeatures.cpp
+@@ -77,6 +77,13 @@ FEXCore::HostFeatures CPUFeatures::FetchHostFeatures(bool IsWine, FEXCore::HostF
+ 
+   FEX::FetchHostFeatures(Features, HostFeatures, !IsWine, CTR, MIDR);
+ 
++  // hbnoafp: hostprof put ~25% of samples on the two serializing FPCR
++  // writes per EC transition (EnterEC sets NEP/AH, ExitFunctionEC clears
++  // them). Without AFP the JIT never sets them, so neither write is needed.
++  // RPRES only gives 12-bit estimates with AH set, so it goes off too.
++  HostFeatures.SupportsAFP = false;
++  HostFeatures.SupportsRPRES = false;
++
+   // Force-disable SVE until wine/windows gain support for SVE context save/restore
+   HostFeatures.SupportsSVE128 = false;
+   HostFeatures.SupportsSVE256 = false;

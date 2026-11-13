@@ -5,11 +5,11 @@
 # Needs: bash, tar with zstd support (GNU tar >= 1.31, plus zstd), sha256sum.
 set -euo pipefail
 
-VERSION="${1:-FH6-1.1}"
+VERSION="${1:-FH6-1.2}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DLL="$ROOT/bin/libarm64ecfex.dll"
 OUT="$ROOT/dist"
-DESC="FEX for Forza Horizon 6 (SMC checks + L1 grow recommit so world entry does not hang). github.com/TimmyTurner51/fh6-wine-fex"
+DESC="FEX for Forza Horizon 6: SMC checks, L1 grow recommit, and the 1.2 runtime fixes for the frame-time beat. github.com/TimmyTurner51/fh6-wine-fex"
 
 [ -f "$DLL" ] || { echo "missing $DLL" >&2; exit 1; }
 mkdir -p "$OUT"
@@ -22,7 +22,7 @@ cat > "$WORK/droiddeck/profile.json" <<EOF
 {
   "type": "FEXCore-Linux",
   "versionName": "$VERSION",
-  "versionCode": 2,
+  "versionCode": 3,
   "description": "$DESC",
   "files": [
     {
@@ -40,7 +40,7 @@ cat > "$WORK/gamenative/profile.json" <<EOF
 {
   "type": "FEXCore",
   "versionName": "$VERSION",
-  "versionCode": 2,
+  "versionCode": 3,
   "description": "$DESC",
   "files": [
     { "source": "system32/libarm64ecfex.dll", "target": "\${system32}/libarm64ecfex.dll" }

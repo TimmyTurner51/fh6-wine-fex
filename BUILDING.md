@@ -6,9 +6,9 @@ You only need this if you want to build the FEX DLL or Wine yourself. To play, f
 ## FEX (`libarm64ecfex.dll`)
 
 The release DLL matches [`TimmyTurner51/FEX`](https://github.com/TimmyTurner51/FEX)
-branch `fh6-dev` at `7e11bf935`. To rebuild that binary, check out that commit.
+branch `fh6-dev` at `3fe750d85`. To rebuild that binary, check out that commit.
 
-To apply only the compatibility fixes on upstream FEX `main` or on `fh6`:
+To apply the same changes to upstream FEX `main`, apply the four patches in order:
 
 ```sh
 git clone https://github.com/FEX-Emu/FEX.git
@@ -17,7 +17,11 @@ git submodule update --init --depth 1
 git apply /path/to/fh6-wine-fex/fex/0001-per-block-invalidation.patch
 git apply /path/to/fh6-wine-fex/fex/0002-block-level-smc-validation.patch
 git apply /path/to/fh6-wine-fex/fex/0003-l1-recommit-on-grow.patch
+git apply /path/to/fh6-wine-fex/fex/0004-jit-stability-and-smc-batching.patch
 ```
+
+That series is checked against FEX `main` at `14c92681`, and the four patches together
+reproduce `bin/libarm64ecfex.dll` byte for byte after `llvm-strip --strip-all`.
 
 Cross-compile the ARM64EC target with [llvm-mingw](https://github.com/mstorsjo/llvm-mingw).
 Point the toolchain file at your llvm-mingw install:
@@ -59,3 +63,18 @@ python3 -c "import sys; print(open(sys.argv[1],'rb').read().count(bytes.fromhex(
 ```
 
 Hundreds of matches means the fix is present. Zero means the game's anti-tamper rejects it.
+
+## Wine (ARM64EC frame registers)
+
+`wine/arm64ec-frame-regs.patch` is the other half of 1.2's stability. An ARM64EC `CONTEXT`
+has no slot for `x13`, `x14`, `x23`, `x24` or `x28`, so translating to and from one zeroes
+them; FEX's JIT keeps live values there. The patch restores them from the syscall frame on
+a continue, and carries them across `wait_suspend()`. Apply it at
+`TimmyTurner51/proton-wine` `462e0d2f` (branch `fh6`) and rebuild Wine:
+
+```sh
+git apply /path/to/fh6-wine-fex/wine/arm64ec-frame-regs.patch
+```
+
+It changes `dlls/ntdll/unix/signal_arm64.c` only. The 1.2 measurements were taken with this
+built into the Proton the game ran under.
