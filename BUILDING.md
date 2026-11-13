@@ -66,15 +66,17 @@ Hundreds of matches means the fix is present. Zero means the game's anti-tamper 
 
 ## Wine (ARM64EC frame registers)
 
-`wine/arm64ec-frame-regs.patch` is the other half of 1.2's stability. An ARM64EC `CONTEXT`
-has no slot for `x13`, `x14`, `x23`, `x24` or `x28`, so translating to and from one zeroes
-them; FEX's JIT keeps live values there. The patch restores them from the syscall frame on
-a continue, and carries them across `wait_suspend()`. Apply it at
-`TimmyTurner51/proton-wine` `462e0d2f` (branch `fh6`) and rebuild Wine:
+`wine/arm64ec-frame-regs.patch` is optional. An ARM64EC `CONTEXT` has no slot for `x13`,
+`x14`, `x23`, `x24` or `x28`, so translating to and from one zeroes them; FEX's JIT keeps
+live values there. The patch restores them from the syscall frame on a continue, and
+carries them across `wait_suspend()`. Apply it at `TimmyTurner51/proton-wine` `462e0d2f`
+(branch `fh6`) and rebuild Wine:
 
 ```sh
 git apply /path/to/fh6-wine-fex/wine/arm64ec-frame-regs.patch
 ```
 
-It changes `dlls/ntdll/unix/signal_arm64.c` only. The 1.2 measurements were taken with this
-built into the Proton the game ran under.
+It changes `dlls/ntdll/unix/signal_arm64.c` only. The 1.2 frame rate and the absence of
+the per-second beat were reproduced on **stock DroidDeck-Proton 11-12.5 with its own
+ntdll**, so this patch is not needed for either. Keep it in mind only if a session ends
+with the game vanishing at a suspend.

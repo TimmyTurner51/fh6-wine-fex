@@ -31,22 +31,67 @@ Everything installs on the phone itself. You don't need a PC, adb or any scripts
 
    | Setting | Value |
    |---|---|
-   | Proton | **DroidDeck-Proton 11-12.3** (or newer) |
+   | Proton | **DroidDeck-Proton 11-12.3** (or newer; tested on 11-12.5) |
    | FEX | **FH6-1.2** |
    | FEX preset | **Denuvo** |
-   | Custom FEX variables | `FEX_TSOENABLED=1`, `FEX_HALFBARRIERTSOENABLED=1`, and `FEX_POOL_CLONE=1` |
+   | Custom FEX variables | the table below |
 
-   Don't skip TSO. The Denuvo preset turns x86 memory ordering off, and without it the
-   game stalls on the splash or loading screen. `FEX_POOL_CLONE=1` stops a recompile
-   storm during load. Optional: `FEX_FH6_FASTUD=1` makes the anti-tamper's illegal-opcode
-   traps cheaper (same guest exception, no host SIGILL).
+   **The variables are not optional.** Without them the game runs, but every second or so
+   it stalls for about half a second. That beat is the reason this section exists.
+
+   Paste this into the game's **Custom FEX variables** field. It is the exact set the
+   frame-rate result was measured with, so copy it whole rather than picking from it. They
+   hold for that game only.
+
+   ```
+   FEX_TSOENABLED=1
+   FEX_HALFBARRIERTSOENABLED=1
+   FEX_VECTORTSOENABLED=0
+   FEX_MEMCPYSETTSOENABLED=0
+   FEX_SMCCHECKS=full
+   FEX_POOL_CLONE=1
+   FEX_FH6_FASTUD=1
+   FEX_DYNAMICL1CACHE=0
+   FEX_PROFILESTATS=0
+   FEX_SILENTLOG=1
+   FEX_DISKCACHEMAXFILESIZE=8589934592
+   FEX_SKIP_SRA_FLUSH=0
+   FEX_FH6_STATS=0
+   FEX_FH6_UDINPROC=0
+   PROTON_NO_NTSYNC=1
+   PROTON_NO_ESYNC=1
+   PROTON_NO_FSYNC=0
+   WINE_FAST_YIELD=1
+   WINEDEBUG=-all
+   TU_DEBUG=startup
+   ```
+
+   What the important ones do:
+
+   | Variable | Value | Why |
+   |---|---|---|
+   | `FEX_TSOENABLED` | `1` | The Denuvo preset sets this to `0`. Without it the game stalls on the splash or loading screen. |
+   | `FEX_HALFBARRIERTSOENABLED` | `1` | Same reason. |
+   | `FEX_DYNAMICL1CACHE` | `0` | Keeps FEX's lookup table a fixed size, so it cannot grow in the middle of a drive. |
+   | `FEX_PROFILESTATS` | `0` | Proton defaults it on, and it puts a clock read around FEX's own locks. |
+   | `FEX_POOL_CLONE` | `1` | Holds back the recompile storm during load. |
+   | `PROTON_NO_NTSYNC` / `PROTON_NO_ESYNC` | `1` | Steps around a sync path that can block a frame. |
+   | `WINEDEBUG` | `-all` | Otherwise Wine logs every call and the frame rate collapses. |
+
+   The rest set the preset's memory-ordering flags explicitly, keep logging off the hot
+   path, and give the disk cache room. They are in the list because the measurement used
+   them.
+
+   The `.wcp` cannot set these itself. A DroidDeck package only carries files, and the FEX
+   preset is applied underneath it, so the per-game field is the only place that can
+   override the preset.
 
 5. **Launch the game** from Steam.
    The first launch takes several minutes, because FEX translates the game and fills its
    cache. Later launches are faster.
 
-If the overlay shows `DroidDeck-Proton 11-12.3` and the game reaches the main menu, it
-worked.
+If the overlay shows `DroidDeck-Proton 11-12.5` (or whatever you installed) and the game
+reaches the main menu, it worked.
 
 ## What to expect
 
@@ -54,14 +99,14 @@ worked.
 - About **44–49 FPS** in the world at 1590×720, mean over a 180-second hold, with the
   slowest second at 39–41 and the fastest at 50–56. That is roughly 15 FPS above 1.1 on
   the same road.
-- The regular frame-time beat that 1.1 showed once a second is gone.
-- No crash and no core across two full holds back to back. That run used the FEX in this
-  repo together with the ntdll change in
-  [`wine/arm64ec-frame-regs.patch`](wine/arm64ec-frame-regs.patch), which keeps the
-  registers an x64 context cannot carry. DroidDeck-Proton 11-12.3 does not ship that
-  change yet, so if a session still ends with the game vanishing at a suspend, that is
-  the piece that is missing.
-- The phone gets hot. Expect throttling after about 6–8 minutes without a cooler.
+- The regular frame-time beat that 1.1 showed once a second is gone. That depends on the
+  variables in step 4 being set; see the troubleshooting table if it comes back.
+- No crash and no core. Re-measured on **stock DroidDeck-Proton 11-12.5 with its own
+  ntdll**, importing only the `.wcp` from this release: no 550 ms beat, and 56 FPS in the
+  world on the last sample. The Wine patch below is *not* required for that result.
+- The phone gets hot. Expect throttling after about 6–8 minutes without a cooler. The game
+  reaches 80 °C+ and then the frame rate drops; everything above is measured on a cool
+  device.
 
 ## What changed in 1.2
 
@@ -84,10 +129,12 @@ with no 550 ms frame beats and no frames slower than 80 ms.
 |---|---|
 | Game closes about a second after launch | Proton is wrong. Select DroidDeck-Proton for the game, not Proton Experimental. |
 | Stuck on splash or loading screen, CPU busy, nothing progresses | `FEX_TSOENABLED=1` and `FEX_HALFBARRIERTSOENABLED=1` are missing from the game's custom FEX variables. |
+| Stalls for about half a second, roughly once a second | The step 4 variables are missing or incomplete. Apply the whole list exactly as written; that is the combination that was measured. |
+| Good for a while, then stutters as it heats up | Thermal throttling, not the package. Let it cool or add a cooler. |
 | Anti-tamper or "integrity" error | The FEX package isn't active. Check that the game's FEX shows **FH6-1.2**, and the preset is **Denuvo** (it turns on full code checks). |
 | Hard halt on garage / world loading | You are on FH6-1.0. Import **FH6-1.2**, which keeps the L1 lookup table committed when it grows. |
 | FPS stuck around 30 like 1.1 | The game is still on the old package. Re-import `fh6-fex-droiddeck.wcp` and check the FEX shows **FH6-1.2**. |
-| Game disappears mid-session at a suspend | The Wine side is missing `wine/arm64ec-frame-regs.patch`. See [What to expect](#what-to-expect). |
+| Game disappears mid-session at a suspend | Rare, and not covered by the package. `wine/arm64ec-frame-regs.patch` in this repo addresses it if you build your own Proton. See [BUILDING.md](BUILDING.md). |
 | Very slow, single-digit FPS | Check that the preset is **Denuvo**. Other presets turn the code checks off or use a slower mode. Let the phone cool down too, because a throttled CPU halves the frame rate. |
 | Steam updated Proton and things broke | Your DroidDeck-Proton choice is per game and isn't touched by Steam updates. Re-check step 4. |
 
