@@ -174,6 +174,8 @@ with no 550 ms frame beats and no frames slower than 80 ms.
 | Very slow, single-digit FPS | Check that the preset is **Denuvo**. Other presets turn the code checks off or use a slower mode. Let the phone cool down too, because a throttled CPU halves the frame rate. |
 | Steam updated Proton and things broke | Your DroidDeck-Proton choice is per game and isn't touched by Steam updates. Re-check step 4. |
 | Winlator says **Install Failed: Content cannot be trusted** | You picked `fh6-fex-droiddeck.wcp`. Winlator only takes `${system32}` targets, so import `fh6-fex-gamenative.wcp`. See [Winlator](#winlator-gamenative-and-other-winlator-style-apps). |
+| On Winlator, Steam opens as a blank white window | Steam is running but can't draw. Add `-cef-disable-gpu -no-cef-sandbox` to the Steam shortcut's arguments. See [Steam opens as a blank white window](#steam-opens-as-a-blank-white-window). |
+| On Winlator, the game says it can't initialize the Steam client | Steam must be running and logged in before the game starts. Fix the blank Steam window first, sign in, then launch the game. |
 
 ## Winlator, GameNative and other Winlator-style apps
 
@@ -212,6 +214,38 @@ So the `type` string alone is not the trigger — the `${proton}` target is. The
 of the DroidDeck package that bionic will take, and no need for one: import
 `fh6-fex-gamenative.wcp` instead. Choosing a different entry in the **Content Type**
 dropdown does not help; the check happens against the file's own `profile.json`.
+
+### Steam opens as a blank white window
+
+On Winlator, Steam sometimes starts and looks like it is doing nothing. It is actually
+running fine behind the scenes — its window just never gets painted, so all you see is a
+blank white panel. If you tap around where the login box should be, the cursor still changes
+shape, which is the tell.
+
+Steam draws its interface with Chromium through D3D, and that path doesn't work on Winlator's
+default graphics driver. Turning the Chromium hardware acceleration off fixes it.
+
+How to do it:
+
+1. Quit Steam. Close the container too, so nothing is still running.
+2. Go back to the container's desktop and find the **Steam** icon.
+3. Open its **Properties** (right-click, or long-press), find the **Arguments** box.
+4. Add these two, exactly as written, and save:
+
+   ```
+   -cef-disable-gpu -no-cef-sandbox
+   ```
+
+5. Launch Steam again. It takes a few seconds longer to appear than before, because it is
+   now drawing with software instead of the GPU.
+
+The same fix applies on Winlator Cmod and on GameNative. It's a Winlator-side limitation and
+nothing to do with the FEX package, so you only do it once per container.
+
+One gotcha: if the arguments seem to be ignored, check that the shortcut launches
+`steam.exe` directly rather than a `.lnk` file. Arguments added to a shortcut that just opens
+a `.lnk` are often dropped silently. Point the shortcut at
+`C:\Program Files (x86)\Steam\steam.exe` with the two arguments on the end, and it will stick.
 
 ### Still required beyond the package
 
