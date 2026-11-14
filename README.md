@@ -24,17 +24,6 @@ Everything installs on the phone itself. You don't need a PC, adb or any scripts
    **11-12.3 or newer** (11-12.7 is current; 11-12.5 is what the frame rates below were
    measured on).
 
-   There is no "add Proton" action and no "Proton versions" row in Setup itself, so there is
-   nothing to hunt for and no repository URL to paste. DroidDeck already knows the
-   `Droid-Deck/DroidDeck-Proton` releases, and each build is simply a row with a **Get** button.
-
-   The Get button stays greyed out until two things are true, and either one looks like
-   "there's no way to do this":
-   - The **Linux runtime** is installed. If the Proton tab says *Install the Linux runtime
-     from Setup first*, do that before coming back.
-   - **No session is running.** DroidDeck refuses to install or remove a compatibility tool
-     while Steam or a game is up. Stop the session first.
-
    Valve's *Proton Experimental (ARM64)* will **not** work. It is missing a Wine fix the
    anti-tamper needs (see [Why DroidDeck-Proton](#why-droiddeck-proton)).
 
