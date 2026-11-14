@@ -11,6 +11,10 @@ Everything installs on the phone itself. You don't need a PC, adb or any scripts
 - A Snapdragon 8 Elite class device. That's what this was tested on (Adreno 830, 120 Hz panel).
 - About 12 GB of free RAM plus swap. The game uses 9–11 GB in the world.
 
+The steps below are for DroidDeck. On Winlator or GameNative the FEX still imports, but you
+need the other package and the app's own Wine — see
+[Winlator, GameNative and other Winlator-style apps](#winlator-gamenative-and-other-winlator-style-apps).
+
 ## Install (DroidDeck, 5 steps)
 
 1. **Download the FEX package on your phone.**
@@ -169,15 +173,55 @@ with no 550 ms frame beats and no frames slower than 80 ms.
 | Game disappears mid-session at a suspend | Rare, and not covered by the package. `wine/arm64ec-frame-regs.patch` in this repo addresses it if you build your own Proton. See [BUILDING.md](BUILDING.md). |
 | Very slow, single-digit FPS | Check that the preset is **Denuvo**. Other presets turn the code checks off or use a slower mode. Let the phone cool down too, because a throttled CPU halves the frame rate. |
 | Steam updated Proton and things broke | Your DroidDeck-Proton choice is per game and isn't touched by Steam updates. Re-check step 4. |
+| Winlator says **Install Failed: Content cannot be trusted** | You picked `fh6-fex-droiddeck.wcp`. Winlator only takes `${system32}` targets, so import `fh6-fex-gamenative.wcp`. See [Winlator](#winlator-gamenative-and-other-winlator-style-apps). |
 
-## GameNative and other Winlator-style apps (untested)
+## Winlator, GameNative and other Winlator-style apps
 
-`fh6-fex-gamenative.wcp` in the same release is the same FEX in the `FEXCore` package
-format these apps import. It won't be enough on its own. The app's Wine must also include
-the import-thunk fix in [`wine/spec32-arm64x-import-thunk.patch`](wine/spec32-arm64x-import-thunk.patch),
-and you need the same FEX variables as above (`FEX_SMCCHECKS=full`, `FEX_HIDEHYPERVISORBIT=1`,
+**Which package goes where.** There are two `.wcp` files in each release and they are not
+interchangeable. The app's importer decides which one it will take, so match the app:
+
+| App | Package to import | Importer type it needs |
+|---|---|---|
+| DroidDeck | `fh6-fex-droiddeck.wcp` | `FEXCore-Linux` — the app copies into its own Proton (`${proton}`) |
+| Winlator (bionic builds, `com.winlator.cmod`) | `fh6-fex-gamenative.wcp` | `FEXCore` — files land in the container's `${system32}` |
+| Winlator Cmod / Ludashi (`com.ludashi.benchmark`) | `fh6-fex-gamenative.wcp` | `FEXCore` |
+| GameNative | `fh6-fex-gamenative.wcp` | `FEXCore` |
+
+Import is verified on Winlator bionic (`7.1.4x-cmod`): `fh6-fex-gamenative.wcp` reports
+**Content installed successfully!** and then lists as **FH6-1.2 / version code 3** in
+Contents → **FEXCore**. That is the whole import step — Contents → **Content Type: FEXCore**
+→ **Install Content** → pick the file → **Continue**.
+
+### "Install Failed: Content cannot be trusted."
+
+Bionic raises this on `fh6-fex-droiddeck.wcp`, and it is a packaging rule, not a corrupted
+download or a bad signature. Bionic's importer only accepts `FEXCore` entries whose target
+is a `${system32}` path. The DroidDeck package targets
+`${proton}/files/lib/wine/aarch64-windows/libarm64ecfex.dll`, and `${proton}` is a
+DroidDeck-only variable that bionic does not resolve, so every file in it is rejected.
+
+Measured on the same DLL, changing one field at a time:
+
+| `type` | target | Result |
+|---|---|---|
+| `FEXCore-Linux` | `${proton}/…/libarm64ecfex.dll` | Install Failed: Content cannot be trusted. |
+| `FEXCore` | `${proton}/…/libarm64ecfex.dll` | Install Failed: Content cannot be trusted. |
+| `FEXCore` | `${system32}/libarm64ecfex.dll` | Content installed successfully! |
+
+So the `type` string alone is not the trigger — the `${proton}` target is. There is no build
+of the DroidDeck package that bionic will take, and no need for one: import
+`fh6-fex-gamenative.wcp` instead. Choosing a different entry in the **Content Type**
+dropdown does not help; the check happens against the file's own `profile.json`.
+
+### Still required beyond the package
+
+Importing the FEX is not enough on its own. The app's Wine must also include the import-thunk
+fix in [`wine/spec32-arm64x-import-thunk.patch`](wine/spec32-arm64x-import-thunk.patch), and
+you need the same FEX variables as above (`FEX_SMCCHECKS=full`, `FEX_HIDEHYPERVISORBIT=1`,
 `FEX_TSOENABLED=1`, `FEX_HALFBARRIERTSOENABLED=1`), plus `VKD3D_FEATURE_LEVEL=12_2` and
-`VKD3D_SHADER_MODEL=6_9` or the game stops at its GPU dialog. This path hasn't been tested.
+`VKD3D_SHADER_MODEL=6_9` or the game stops at its GPU dialog. A `.wcp` carries files only and
+cannot set environment variables. Running the game this way has not been tested; only the
+import is verified.
 
 ## Why the game says GPU unsupported
 
@@ -208,8 +252,8 @@ has none.
 
 | Path | What it is |
 |---|---|
-| Releases → `fh6-fex-droiddeck.wcp` | The FEX package for DroidDeck (use this) |
-| Releases → `fh6-fex-gamenative.wcp` | Same FEX, packaged for GameNative/Winlator-style apps |
+| Releases → `fh6-fex-droiddeck.wcp` | The FEX package for DroidDeck (use this on DroidDeck) |
+| Releases → `fh6-fex-gamenative.wcp` | Same FEX, `FEXCore` package for Winlator bionic / Cmod / GameNative |
 | `bin/libarm64ecfex.dll` | The bare FEX DLL inside both packages (sha256 `694c52e7…`) |
 | `fex/*.patch` | FEX source patches: SMC checks, L1 grow recommit, and the 1.2 runtime work |
 | `wine/*.patch` | The Wine import-thunk patch and the ARM64EC frame-register patch |
