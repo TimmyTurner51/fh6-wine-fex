@@ -223,6 +223,44 @@ you need the same FEX variables as above (`FEX_SMCCHECKS=full`, `FEX_HIDEHYPERVI
 cannot set environment variables. Running the game this way has not been tested; only the
 import is verified.
 
+### Building the bionic Wine yourself — attempted, blocked
+
+If you would rather supply your own ARM64EC Wine instead of waiting for a bionic Proton that
+carries the fix, this is what was tried and where it stopped. Everything below was measured on
+`com.winlator.cmod` (Winlator bionic) with an RM10 Pro.
+
+Configuring a bionic tree is `wine/build-scripts/build-step-arm64ec.sh` in the upstream
+Winlator build repo: NDK `27.3.13750724`, `--enable-archs=arm64ec,aarch64,i386`,
+`--host=aarch64-linux-android28`, `--with-mingw=clang`, plus `llvm-mingw-20250920`. Build with
+`PATH` pointing at llvm-mingw, then:
+
+```sh
+make -C wine-tools -j$(nproc) __tooldeps__   # rebuild winebuild with the patch in place
+make -C dlls/kernel32 -j$(nproc)             # regenerate the import thunks
+```
+
+**Checking the patch actually landed.** Count the hotpatch prologue
+`48 8d a4 24 00 00 00 00 ff 25` in the built `kernel32.dll`. Stock `proton-9.0-arm64ec`
+scores **0**; rebuilt from this repo's patch it scores **795**; DroidDeck-Proton 11-12.3 ships
+**797**. A rebuild is not needed to answer this — the byte pattern is the whole test.
+
+**What blocks it on bionic.** Two things, both in the app rather than in Wine:
+
+1. The **Wine Version** list only shows directories in `imagefs/opt` whose name matches
+   `^(wine|proton)-([0-9.]+)-?([0-9.]+)?-(x86|x86_64|arm64ec)$`, and a new container's prefix
+   is unpacked from an APK asset named `<version>_container_pattern.tzst`. A newly imported
+   Proton lands in `files/contents/Proton/<versionName>-<versionCode>`, which matches neither
+   rule, so the container silently falls back to `proton-9.0-x86_64`.
+2. Putting the build under a recognised name (`proton-9.0-arm64ec`) gets further — the prefix
+   is created and `system32/kernel32.dll` becomes the patched 1048576-byte file, so the Wine
+   itself runs — but the container desktop never comes up and the app restarts. A second
+   container built from a hand-written `.container` failed the same way on stock Wine, so this
+   is a container compose/config failure, not proof that the Wine build is bad.
+
+`adb logcat` is empty on this device, so there was no native stack to read. The import path is
+verified; booting the game on bionic with a self-built Wine is not. DroidDeck stays the
+supported route.
+
 ## Why the game says GPU unsupported
 
 Forza's engine asks Direct3D 12 what the device can do — feature level and shader model — and
