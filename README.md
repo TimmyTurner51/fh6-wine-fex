@@ -18,23 +18,21 @@ Everything installs on the phone itself. You don't need a PC, adb or any scripts
    and download **`fh6-fex-droiddeck.wcp`**.
 
 2. **Install DroidDeck-Proton.**
-   Open **Setup**, press the **Components** card, then switch to the **Proton** tab. The tabs
-   run **GPU · Proton · DXVK · VKD3D · FEX**, so Proton is the second one. DroidDeck-Proton
-   appears under the **Available** heading; press **Get** beside it. Install version
-   **11-12.3 or newer** (11-12.7 is current; 11-12.5 is what the frame rates below were
-   measured on).
+   Open the **Components** tab on DroidDeck's bottom bar and pick **Proton** (the tabs run
+   **GPU · Proton · DXVK · VKD3D · FEX**). DroidDeck-Proton is under **Available**; press
+   **Get**. Install version **11-12.3 or newer** (11-12.7 is current; 11-12.5 is what the
+   frame rates below were measured on).
 
    Valve's *Proton Experimental (ARM64)* will **not** work. It is missing a Wine fix the
    anti-tamper needs (see [Why DroidDeck-Proton](#why-droiddeck-proton)).
 
 3. **Import the package.**
-   Open **Components**, tap **Import .wcp**, and pick `fh6-fex-droiddeck.wcp` from your
+   On the **FEX** tab of Components, tap **Import .wcp** and pick `fh6-fex-droiddeck.wcp` from
    Downloads. It shows up as FEX **FH6-1.2**.
 
 4. **Set up Forza Horizon 6's profile.**
-   Go back to **Setup** with **Forza Horizon 6** selected as the current game, and press the
-   **Components** card. With a game selected, that card opens *that game's* profile instead of
-   the general components page. Set:
+   On the **Components** tab, tap the **Profile** chip at the top (it reads **Default profile**)
+   and pick **Forza Horizon 6**. The page then edits that game's settings. Set:
 
    | Setting | Value |
    |---|---|
