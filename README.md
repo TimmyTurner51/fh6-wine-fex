@@ -18,7 +18,23 @@ Everything installs on the phone itself. You don't need a PC, adb or any scripts
    and download **`fh6-fex-droiddeck.wcp`**.
 
 2. **Install DroidDeck-Proton.**
-   In DroidDeck, open **Setup**, add **DroidDeck-Proton**, and install version **11-12.3 or newer**.
+   Open **Setup**, press the **Components** card, then switch to the **Proton** tab. The tabs
+   run **GPU · Proton · DXVK · VKD3D · FEX**, so Proton is the second one. DroidDeck-Proton
+   appears under the **Available** heading; press **Get** beside it. Install version
+   **11-12.3 or newer** (11-12.7 is current; 11-12.5 is what the frame rates below were
+   measured on).
+
+   There is no "add Proton" action and no "Proton versions" row in Setup itself, so there is
+   nothing to hunt for and no repository URL to paste. DroidDeck already knows the
+   `Droid-Deck/DroidDeck-Proton` releases, and each build is simply a row with a **Get** button.
+
+   The Get button stays greyed out until two things are true, and either one looks like
+   "there's no way to do this":
+   - The **Linux runtime** is installed. If the Proton tab says *Install the Linux runtime
+     from Setup first*, do that before coming back.
+   - **No session is running.** DroidDeck refuses to install or remove a compatibility tool
+     while Steam or a game is up. Stop the session first.
+
    Valve's *Proton Experimental (ARM64)* will **not** work. It is missing a Wine fix the
    anti-tamper needs (see [Why DroidDeck-Proton](#why-droiddeck-proton)).
 
@@ -27,21 +43,34 @@ Everything installs on the phone itself. You don't need a PC, adb or any scripts
    Downloads. It shows up as FEX **FH6-1.2**.
 
 4. **Set up Forza Horizon 6's profile.**
-   On the Components page, open the profile for **Forza Horizon 6** and set:
+   Go back to **Setup** with **Forza Horizon 6** selected as the current game, and press the
+   **Components** card. With a game selected, that card opens *that game's* profile instead of
+   the general components page. Set:
 
    | Setting | Value |
    |---|---|
    | Proton | **DroidDeck-Proton 11-12.3** (or newer; tested on 11-12.5) |
    | FEX | **FH6-1.2** |
-   | FEX preset | **Denuvo** |
-   | Custom FEX variables | the table below |
+   | FEX preset | **Denuvo** — pick this *first* |
+   | Per-game environment | the 20 variables below, added one at a time |
 
    **The variables are not optional.** Without them the game runs, but every second or so
    it stalls for about half a second. That beat is the reason this section exists.
 
-   Paste this into the game's **Custom FEX variables** field. It is the exact set the
-   frame-rate result was measured with, so copy it whole rather than picking from it. They
-   hold for that game only.
+   **Denuvo first, then the variables.** Selecting the Denuvo preset writes the anti-tamper
+   baseline into the game's environment (`FEX_SMCCHECKS=full`, `FEX_HIDEHYPERVISORBIT=1`,
+   `FEX_MULTIBLOCK=1`, `FEX_X87REDUCEDPRECISION=1`). The list below only *overrides* four of
+   those keys and adds the rest, so it has to sit on top of the preset. Do not re-select the
+   Denuvo preset afterwards: that rewrites the preset's own keys and throws the overrides away.
+
+   There is **no "Custom FEX variables" field to paste into**. That label is not a setting — it
+   is what the preset chip *displays* when the game's stored values no longer match any built-in
+   preset. So after you add the first override below, the chip will read **Custom FEX
+   variables** instead of **Denuvo**. That is the correct end state; it is not a mistake, and
+   the baseline is still in place.
+
+   Add the variables in **per-game environment → Add variable**, one name and value at a time.
+   They apply to this game only.
 
    ```
    FEX_TSOENABLED=1
@@ -83,8 +112,8 @@ Everything installs on the phone itself. You don't need a PC, adb or any scripts
    them.
 
    The `.wcp` cannot set these itself. A DroidDeck package only carries files, and the FEX
-   preset is applied underneath it, so the per-game field is the only place that can
-   override the preset.
+   preset is applied underneath it, so the game's own environment entries are the only place
+   that can override the preset.
 
 5. **Launch the game** from Steam.
    The first launch takes several minutes, because FEX translates the game and fills its
