@@ -24,8 +24,11 @@ Everything installs on the phone itself. You don't need a PC, adb or any scripts
    measured on 11-12.5, and 11-12.7 was verified to boot with the same setup).
 
    The exact version is not what decides whether the game launches. 11-12.5, 11-12.6 and
-   11-12.7 ship the same Wine pin and the same graphics stack, so if one of them raises a
-   GPU dialog, the missing `VKD3D_*` variables in step 4 are the cause, not the version.
+   11-12.7 ship the same Wine, GE-Proton and CachyOS pins; the only changes between them are
+   ntdll patches. So if one of them raises a GPU dialog, the missing `VKD3D_*` variables in
+   step 4 are the cause, not the version. DXVK and VKD3D-Proton are separate Components
+   entries scoped to **This Proton**, so those can differ between two installed builds even
+   when the builds themselves match.
 
    Valve's *Proton Experimental (ARM64)* will **not** work. It is missing a Wine fix the
    anti-tamper needs (see [Why DroidDeck-Proton](#why-droiddeck-proton)).
