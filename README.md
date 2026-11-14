@@ -20,8 +20,12 @@ Everything installs on the phone itself. You don't need a PC, adb or any scripts
 2. **Install DroidDeck-Proton.**
    Open the **Components** tab on DroidDeck's bottom bar and pick **Proton** (the tabs run
    **GPU · Proton · DXVK · VKD3D · FEX**). DroidDeck-Proton is under **Available**; press
-   **Get**. Install version **11-12.3 or newer** (11-12.7 is current; 11-12.5 is what the
-   frame rates below were measured on).
+   **Get**. Install version **11-12.3 or newer** (11-12.7 is current; the frame rates below were
+   measured on 11-12.5, and 11-12.7 was verified to boot with the same setup).
+
+   The exact version is not what decides whether the game launches. 11-12.5, 11-12.6 and
+   11-12.7 ship the same Wine pin and the same graphics stack, so if one of them raises a
+   GPU dialog, the missing `VKD3D_*` variables in step 4 are the cause, not the version.
 
    Valve's *Proton Experimental (ARM64)* will **not** work. It is missing a Wine fix the
    anti-tamper needs (see [Why DroidDeck-Proton](#why-droiddeck-proton)).
@@ -36,13 +40,16 @@ Everything installs on the phone itself. You don't need a PC, adb or any scripts
 
    | Setting | Value |
    |---|---|
-   | Proton | **DroidDeck-Proton 11-12.3** (or newer; tested on 11-12.5) |
+   | Proton | **DroidDeck-Proton 11-12.3** or newer (boot verified on 11-12.7; frame rates measured on 11-12.5) |
    | FEX | **FH6-1.2** |
    | FEX preset | **Denuvo** — pick this *first* |
-   | Per-game environment | the 20 variables below, added one at a time |
+   | Per-game environment | the 22 variables below, added one at a time |
 
-   **The variables are not optional.** Without them the game runs, but every second or so
-   it stalls for about half a second. That beat is the reason this section exists.
+   **The variables are not optional, and the two `VKD3D_*` ones gate the launch.** Without
+   `VKD3D_FEATURE_LEVEL` and `VKD3D_SHADER_MODEL` the game starts, raises its own
+   **GPU unsupported** dialog and never reaches the menu. Without the FEX variables it gets
+   in-world, but stalls for about half a second roughly once a second. The two halves of the
+   list prevent two different failures, so leaving either out looks like a different bug.
 
    **Denuvo first, then the variables.** Selecting the Denuvo preset writes the anti-tamper
    baseline into the game's environment (`FEX_SMCCHECKS=full`, `FEX_HIDEHYPERVISORBIT=1`,
@@ -80,12 +87,16 @@ Everything installs on the phone itself. You don't need a PC, adb or any scripts
    WINE_FAST_YIELD=1
    WINEDEBUG=-all
    TU_DEBUG=startup
+   VKD3D_FEATURE_LEVEL=12_2
+   VKD3D_SHADER_MODEL=6_9
    ```
 
    What the important ones do:
 
    | Variable | Value | Why |
    |---|---|---|
+   | `VKD3D_FEATURE_LEVEL` | `12_2` | Pins the Direct3D 12 feature level handed to the game. Left unset, vkd3d reports whatever it detects, which is below Forza's floor, and the game refuses to continue. |
+   | `VKD3D_SHADER_MODEL` | `6_9` | Same kind of override for the shader model. It has to move with the feature level. |
    | `FEX_TSOENABLED` | `1` | The Denuvo preset sets this to `0`. Without it the game stalls on the splash or loading screen. |
    | `FEX_HALFBARRIERTSOENABLED` | `1` | Same reason. |
    | `FEX_DYNAMICL1CACHE` | `0` | Keeps FEX's lookup table a fixed size, so it cannot grow in the middle of a drive. |
@@ -111,7 +122,8 @@ reaches the main menu, it worked.
 
 ## What to expect
 
-- It boots and passes the anti-tamper checks, with no checks disabled.
+- It boots through both of the game's own gates: the GPU / D3D12 feature-level check and the
+  anti-tamper checks, with no checks disabled.
 - About **44–49 FPS** in the world at 1590×720, mean over a 180-second hold, with the
   slowest second at 39–41 and the fastest at 50–56. That is roughly 15 FPS above 1.1 on
   the same road.
@@ -143,6 +155,7 @@ with no 550 ms frame beats and no frames slower than 80 ms.
 
 | Problem | Fix |
 |---|---|
+| The game itself reports **GPU unsupported** (its own dialog, not a DroidDeck error) and never reaches the menu | `VKD3D_FEATURE_LEVEL=12_2` and `VKD3D_SHADER_MODEL=6_9` are missing from the game's environment. vkd3d's auto-detected feature level is below Forza's floor, so the engine refuses. Add both, then relaunch. |
 | Game closes about a second after launch | Proton is wrong. Select DroidDeck-Proton for the game, not Proton Experimental. |
 | Stuck on splash or loading screen, CPU busy, nothing progresses | `FEX_TSOENABLED=1` and `FEX_HALFBARRIERTSOENABLED=1` are missing from the game's custom FEX variables. |
 | Stalls for about half a second, roughly once a second | The step 4 variables are missing or incomplete. Apply the whole list exactly as written; that is the combination that was measured. |
@@ -160,7 +173,24 @@ with no 550 ms frame beats and no frames slower than 80 ms.
 format these apps import. It won't be enough on its own. The app's Wine must also include
 the import-thunk fix in [`wine/spec32-arm64x-import-thunk.patch`](wine/spec32-arm64x-import-thunk.patch),
 and you need the same FEX variables as above (`FEX_SMCCHECKS=full`, `FEX_HIDEHYPERVISORBIT=1`,
-`FEX_TSOENABLED=1`, `FEX_HALFBARRIERTSOENABLED=1`). This path hasn't been tested.
+`FEX_TSOENABLED=1`, `FEX_HALFBARRIERTSOENABLED=1`), plus `VKD3D_FEATURE_LEVEL=12_2` and
+`VKD3D_SHADER_MODEL=6_9` or the game stops at its GPU dialog. This path hasn't been tested.
+
+## Why the game says GPU unsupported
+
+Forza's engine asks Direct3D 12 what the device can do — feature level and shader model — and
+refuses to start below its floor. Under vkd3d-proton that answer comes from Vulkan detection
+and comes back lower than the engine will accept, even though an Adreno 830 is well past it.
+The dialog is the game's, raised before the menu, so nothing in DroidDeck's own status line
+mentions it; the only trace is the game's own log ending right after it opens its help link.
+
+`VKD3D_FEATURE_LEVEL=12_2` and `VKD3D_SHADER_MODEL=6_9` pin those two answers, and the engine
+proceeds. That pair is what was verified on 11-12.7; without it the same build stops at the
+dialog.
+
+Both are vkd3d-proton settings, not FEX ones. That is why the `.wcp` cannot fix this and why a
+FEX-only variable list is not enough on its own: the package replaces a runtime library, and
+these live in the game's environment.
 
 ## Why DroidDeck-Proton
 
