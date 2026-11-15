@@ -305,6 +305,9 @@ buffer chain alive, treat every live buffer as JIT when a signal arrives, and er
 entries in batches so a writer cannot park every reader. Twelve patch files would be
 noise, so the 1.2 runtime work is one patch: `0004-jit-stability-and-smc-batching.patch`.
 The four FEX patches together reproduce `bin/libarm64ecfex.dll` exactly.
+`0005-pool-stub-slots.patch` goes on top: the game rewrites a pool of small code stubs
+millions of times a minute, and it gives each stub a few fixed slots so the code buffer
+stops growing. It is not in the release DLL yet.
 
 These are compatibility fixes, not anti-cheat bypasses. They make the ARM64EC runtime
 behave the way native x64 Windows does, so the game's own checks pass honestly.
