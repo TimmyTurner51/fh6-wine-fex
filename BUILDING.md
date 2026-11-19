@@ -23,6 +23,13 @@ git apply /path/to/fh6-wine-fex/fex/0004-jit-stability-and-smc-batching.patch
 That series is checked against FEX `main` at `14c92681`, and the four patches together
 reproduce `bin/libarm64ecfex.dll` byte for byte after `llvm-strip --strip-all`.
 
+`0005-pool-stub-slots.patch` goes on top of them. It stops the code buffer from growing by
+about 1 GB a minute in the world, and it is not in the release DLL yet:
+
+```sh
+git apply /path/to/fh6-wine-fex/fex/0005-pool-stub-slots.patch
+```
+
 Cross-compile the ARM64EC target with [llvm-mingw](https://github.com/mstorsjo/llvm-mingw).
 Point the toolchain file at your llvm-mingw install:
 
